@@ -6,7 +6,7 @@ from botocore.exceptions import ClientError
 bucket = os.getenv("S3_BUCKET", "evidence")
 client = boto3.client(
     "s3",
-    endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://rustfs:9000"),
+    endpoint_url=os.getenv("S3_ENDPOINT_URL", "http://minio:9000"),
     aws_access_key_id=os.getenv("S3_ACCESS_KEY", ""),
     aws_secret_access_key=os.getenv("S3_SECRET_KEY", ""),
     region_name=os.getenv("S3_REGION", "us-east-1"),

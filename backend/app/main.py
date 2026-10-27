@@ -8,12 +8,14 @@ import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Annotated, BinaryIO, Protocol
+from os.path import basename
+from urllib.parse import quote
 
 from argon2 import PasswordHasher
 from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from botocore.exceptions import BotoCoreError
-from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from sqlalchemy import select
@@ -28,6 +30,7 @@ from app.models import (
     Base,
     Case,
     CaseMembership,
+    DownloadAudit,
     Evidence,
     EvidenceLedger,
     User,
@@ -230,6 +233,19 @@ def create_app(
             raise HTTPException(status_code=404, detail="Evidence not found")
         return evidence
 
+    def evidence_response(evidence: Evidence) -> dict:
+        return {
+            "evidence_id": str(evidence.id),
+            "case_id": evidence.case_id,
+            "file_name": evidence.file_name,
+            "content_type": evidence.content_type,
+            "file_sha256": evidence.file_sha256,
+            "byte_size": evidence.byte_size,
+            "status": evidence.status,
+            "object_version_id": evidence.object_version_id,
+            "created_at": evidence.created_at,
+        }
+
     def auth_response(token: str, user: User, expires_at: datetime):
         return {
             "access_token": token,
@@ -314,6 +330,124 @@ def create_app(
     @app.get("/healthz")
     def healthz():
         return {"status": "ok"}
+
+    @app.get("/api/v1/evidence")
+    def list_evidence(
+        user: Annotated[
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "AUDITOR"))
+        ],
+        session: Annotated[Session, Depends(get_db)],
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+        offset: Annotated[int, Query(ge=0)] = 0,
+        case_id: Annotated[str | None, Query(min_length=1, max_length=200)] = None,
+    ):
+        query = (
+            select(Evidence)
+            .join(CaseMembership, CaseMembership.case_id == Evidence.case_id)
+            .where(CaseMembership.user_id == user.id)
+            .order_by(Evidence.created_at.desc(), Evidence.id.desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        if case_id is not None:
+            query = query.where(Evidence.case_id == case_id.strip())
+        return {
+            "items": [
+                evidence_response(evidence) for evidence in session.scalars(query)
+            ],
+            "limit": limit,
+            "offset": offset,
+        }
+
+    @app.get("/api/v1/evidence/{evidence_id}")
+    def get_evidence(
+        evidence_id: uuid.UUID,
+        user: Annotated[
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "AUDITOR"))
+        ],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        evidence = get_authorized_evidence(evidence_id, user, session)
+        events = list(
+            session.execute(
+                select(
+                    EvidenceLedger.sequence,
+                    EvidenceLedger.action_type,
+                    EvidenceLedger.timestamp,
+                )
+                .where(EvidenceLedger.evidence_id == evidence.id)
+                .order_by(EvidenceLedger.sequence)
+            )
+        )
+        response = evidence_response(evidence)
+        response["custody_events"] = [
+            {
+                "sequence": sequence,
+                "action": action_type,
+                "timestamp": timestamp,
+            }
+            for sequence, action_type, timestamp in events
+        ]
+        return response
+
+    @app.get("/api/v1/evidence/{evidence_id}/download")
+    def download_evidence(
+        evidence_id: uuid.UUID,
+        user: Annotated[User, Depends(require_roles("ANALYST"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        evidence = get_authorized_evidence(evidence_id, user, session)
+        try:
+            object_body = app.state.storage.get(
+                key=evidence.object_key, version_id=evidence.object_version_id
+            )
+        except (BotoCoreError, StorageUnavailable) as exc:
+            logger.exception("Evidence download read failed for %s", evidence_id)
+            raise HTTPException(
+                status_code=503, detail="Evidence storage is unavailable"
+            ) from exc
+
+        audit = DownloadAudit(
+            evidence_id=evidence.id,
+            user_id=user.id,
+            timestamp=datetime.now(timezone.utc),
+            object_version_id=evidence.object_version_id,
+            status="INITIATED",
+        )
+        try:
+            session.add(audit)
+            session.commit()
+        except SQLAlchemyError as exc:
+            session.rollback()
+            object_body.close()
+            logger.exception("Evidence download audit commit failed for %s", evidence_id)
+            raise HTTPException(
+                status_code=503, detail="Download could not be audited"
+            ) from exc
+
+        filename = basename(evidence.file_name).replace("\r", "").replace("\n", "")
+        if not filename or filename in {".", ".."}:
+            filename = f"{evidence.id}.bin"
+        encoded_filename = quote(filename, safe="")
+
+        def stream():
+            try:
+                while chunk := object_body.read(CHUNK_SIZE):
+                    yield chunk
+            finally:
+                object_body.close()
+
+        return StreamingResponse(
+            stream(),
+            media_type=evidence.content_type or "application/octet-stream",
+            headers={
+                "Content-Disposition": (
+                    f'attachment; filename="{quote(filename, safe="._-")}"'
+                    f"; filename*=UTF-8''{encoded_filename}"
+                ),
+                "Content-Length": str(evidence.byte_size),
+            },
+        )
 
     @app.post("/api/v1/admin/cases", status_code=201)
     def create_case(

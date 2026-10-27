@@ -13,32 +13,18 @@ services:
       timeout: 3s
       retries: 10
 
-  rustfs-permissions:
-    image: alpine:3.21
-    command: ["sh", "-c", "chown -R 10001:10001 /data"]
-    volumes:
-      - rustfs-data:/data
-    restart: "no"
-
-  rustfs:
-    image: ghcr.io/rustfs/rustfs@sha256:ed9210d6411d77ffceb70d94b964a3cb7d225983368bc25bebe01e995293dcc2
+  minio:
+    image: minio/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
     environment:
-      RUSTFS_VOLUMES: /data
-      RUSTFS_ADDRESS: 0.0.0.0:9000
-      RUSTFS_CONSOLE_ADDRESS: 0.0.0.0:9001
-      RUSTFS_CONSOLE_ENABLE: "true"
-      RUSTFS_ACCESS_KEY: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
-      RUSTFS_SECRET_KEY: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
-      RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "true"
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
     volumes:
-      - rustfs-data:/data
+      - minio-data:/data
     ports:
       - "127.0.0.1:9001:9001"
-    depends_on:
-      rustfs-permissions:
-        condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "sh", "-ec", "curl -fsS http://127.0.0.1:9000/health >/dev/null"]
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:9000/minio/health/live"]
       interval: 5s
       timeout: 3s
       retries: 20
@@ -52,7 +38,7 @@ services:
     env_file:
       - .env
     depends_on:
-      rustfs:
+      minio:
         condition: service_healthy
     restart: "no"
 
@@ -97,4 +83,4 @@ services:
 
 volumes:
   postgres-data:
-  rustfs-data:
+  minio-data:

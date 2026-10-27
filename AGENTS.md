@@ -10,7 +10,7 @@ TRACE means **Tamper-proof Record Archive for Cryptographic Evidence**. It is a 
 
 - `backend/app/`: FastAPI API, persistence models, object storage, and ledger hashing.
 - `backend/tests/`: focused API and ledger tests.
-- `compose.yaml`: local PostgreSQL, RustFS S3, and API services.
+- `compose.yaml`: local PostgreSQL, MinIO S3, and API services.
 - `README.md`: local setup and API examples.
 
 ## Development
@@ -35,5 +35,5 @@ TRACE means **Tamper-proof Record Archive for Cryptographic Evidence**. It is a 
 - Make focused changes, add regression tests for new behavior, and run the relevant test suite.
 - Do not ship generic AI-generated-looking UI. Avoid decorative gradients, glowing/orbiting illustrations, invented metrics or activity, boilerplate marketing slogans, and repeated cards without a user need. Design from actual investigator tasks and verified system data; prefer a restrained, readable evidence-workbench aesthetic with clear labels, useful empty states, and functional controls.
 - Use database migrations for production schema changes; automatic table creation is currently a development convenience.
-- Keep storage-provider behavior behind the storage interface and test retention/version behavior against each supported provider. The single-drive RustFS Compose setup is for local development only and is not a production storage topology.
+- Keep storage-provider behavior behind the storage interface and test retention/version behavior against each supported provider. The single-drive MinIO Compose setup is for local development only and is not a production storage topology.
 - Do not commit `.env`, secrets, real evidence, or generated test evidence.
