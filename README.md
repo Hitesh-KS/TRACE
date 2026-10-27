@@ -52,15 +52,47 @@ case memberships through a reviewed administrative/database setup process before
 an account can upload, verify, or inspect evidence for that case. Existing
 evidence without an established membership is inaccessible through the API.
 
-The development app extends the schema with `Base.metadata.create_all`. Before
-using an existing PostgreSQL database in a managed environment, apply an
-equivalent forward-only migration: create `case_memberships` with a UUID
-foreign key to `users(id)` using `ON DELETE CASCADE`, a unique constraint on
-`(user_id, case_id)`, and an index on `(case_id, user_id)`. Then add only
-reviewed membership rows. Do not backfill every existing user or grant
-membership based on the `case_id` stored on evidence.
+The development app can still create tables with `Base.metadata.create_all`.
+For managed databases, use the forward-only Alembic migrations:
+
+```bash
+cd backend
+alembic upgrade head
+```
+
+For a database created by the earlier `create_all` implementation, back it up,
+verify that it matches the baseline schema, then run:
+
+```bash
+alembic stamp 0001_initial
+alembic upgrade head
+```
+
+The case migration creates `Case` rows for existing distinct evidence case
+identifiers so the new foreign key can be established, but it does not create
+user memberships. Review the schema before stamping; do not stamp an
+incompatible or incomplete database.
 
 The local stack uses RustFS with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance with disk checks bypassed; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The RustFS console is at `http://localhost:9001`.
+
+## Backend endpoint authorization
+
+| Endpoint | Authentication and authorization | Storage/ledger behavior |
+|---|---|---|
+| `GET /healthz` | Public health check | No evidence access |
+| `POST /api/v1/auth/register` | Public; always creates `INVESTIGATOR` | No ledger event |
+| `POST /api/v1/auth/login` | Public; creates a database-backed session | No ledger event |
+| `POST /api/v1/auth/logout` | Authenticated current session | Revokes session only |
+| `GET /api/v1/auth/me` | Authenticated current session | No ledger event |
+| `POST /api/v1/admin/cases` | Authenticated `ADMIN` | Creates case metadata only |
+| `POST /api/v1/admin/case-memberships` | Authenticated `ADMIN`; target user and case must exist | Creates membership only |
+| `POST /api/v1/evidence` | Authenticated `INVESTIGATOR` with membership in the submitted case | Stores the object, then appends `INGEST` |
+| `GET /api/v1/evidence/{evidence_id}/verify` | Authenticated `INVESTIGATOR`, `ANALYST`, or `AUDITOR` with membership; `ADMIN` is denied | Reads the exact object version, validates the chain, then appends `VERIFY` |
+
+Evidence lookups join against `case_memberships` before object storage reads.
+Out-of-scope evidence returns `404` to avoid disclosing its existence.
+Membership provisioning is intentionally limited to the explicit admin
+endpoints; there is no self-assignment or public role-management path.
 
 ## Upload evidence
 
@@ -96,4 +128,8 @@ cd backend
 PYTHONPATH=. pytest
 ```
 
-Tests use SQLite and an in-memory object store. The local Compose deployment uses PostgreSQL and RustFS. The app currently creates the initial database schema on startup; replace this with versioned migrations before production.
+Tests use SQLite and an in-memory object store. The local Compose deployment
+uses PostgreSQL and RustFS. Object storage and database writes are not atomic:
+if the database commit fails after an object upload, the API reports a
+reconciliation-required error and logs the object key/version for an
+operator-managed reconciliation process.

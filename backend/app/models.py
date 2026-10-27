@@ -16,7 +16,7 @@ from sqlalchemy import (
     Uuid,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
 
@@ -40,6 +40,9 @@ class User(Base):
     role: Mapped[str] = mapped_column(String(20), nullable=False, default="INVESTIGATOR")
     is_active: Mapped[bool] = mapped_column(nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    case_memberships: Mapped[list["CaseMembership"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan"
+    )
 
 
 class AuthSession(Base):
@@ -56,6 +59,19 @@ class AuthSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class Case(Base):
+    __tablename__ = "cases"
+
+    case_id: Mapped[str] = mapped_column(String(200), primary_key=True)
+    name: Mapped[str | None] = mapped_column(String(255))
+    description: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    evidence: Mapped[list["Evidence"]] = relationship(back_populates="case")
+    memberships: Mapped[list["CaseMembership"]] = relationship(
+        back_populates="case", cascade="all, delete-orphan"
+    )
+
+
 class CaseMembership(Base):
     __tablename__ = "case_memberships"
     __table_args__ = (
@@ -67,15 +83,24 @@ class CaseMembership(Base):
     user_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
     )
-    case_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    case_id: Mapped[str] = mapped_column(
+        String(200), ForeignKey("cases.case_id", ondelete="CASCADE"), nullable=False
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    user: Mapped[User] = relationship(back_populates="case_memberships")
+    case: Mapped[Case] = relationship(back_populates="memberships")
 
 
 class Evidence(Base):
     __tablename__ = "evidence"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    case_id: Mapped[str] = mapped_column(String(200), nullable=False, index=True)
+    case_id: Mapped[str] = mapped_column(
+        String(200),
+        ForeignKey("cases.case_id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
+    )
     file_name: Mapped[str] = mapped_column(Text, nullable=False)
     content_type: Mapped[str] = mapped_column(String(255), nullable=False)
     file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -84,6 +109,7 @@ class Evidence(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="READY")
     byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    case: Mapped[Case] = relationship(back_populates="evidence")
 
 
 class EvidenceLedger(Base):

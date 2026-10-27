@@ -2,16 +2,17 @@ import hashlib
 import io
 import uuid
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine
+import pytest
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
 from app.main import create_app
-from app.models import Base, CaseMembership, User
+from app.models import AuthSession, Base, Case, CaseMembership, User
 
 
 class MemoryStorage:
@@ -27,7 +28,7 @@ class MemoryStorage:
         return io.BytesIO(self.objects[(key, version_id)])
 
 
-def make_client():
+def make_client(*, actor_role="INVESTIGATOR"):
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
@@ -45,11 +46,17 @@ def make_client():
     app = create_app(settings, storage=storage, session_factory=sessions, create_schema=False)
     with sessions() as session:
         session.add(
+            Case(
+                case_id="case-1",
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.add(
             User(
                 id=uuid.UUID(settings.actor_id),
                 email="configured-actor@local",
                 password_hash="not-used",
-                role="INVESTIGATOR",
+                role=actor_role,
                 is_active=True,
                 created_at=datetime.now(timezone.utc),
             )
@@ -154,8 +161,36 @@ def test_auth_rejects_duplicate_registration_and_bad_password():
     ).status_code == 401
 
 
-def test_registered_user_without_case_assignment_cannot_upload():
+def test_expired_session_is_rejected():
     client, _ = make_client()
+    registration = client.post(
+        "/api/v1/auth/register",
+        json={"email": "expired@example.test", "password": "correct horse battery"},
+    )
+    assert registration.status_code == 201
+    token = client.post(
+        "/api/v1/auth/login",
+        json={"email": "expired@example.test", "password": "correct horse battery"},
+    ).json()["access_token"]
+    with client.app.state.session_factory() as session:
+        auth_session = session.scalar(
+            select(AuthSession).where(
+                AuthSession.token_hash == hashlib.sha256(token.encode()).hexdigest()
+            )
+        )
+        auth_session.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+        session.commit()
+    assert (
+        client.get(
+            "/api/v1/auth/me",
+            headers={"Authorization": f"Bearer {token}"},
+        ).status_code
+        == 401
+    )
+
+
+def test_registered_user_without_case_assignment_cannot_upload():
+    client, storage = make_client()
     registration = client.post(
         "/api/v1/auth/register",
         json={"email": "unassigned@example.test", "password": "correct horse battery"},
@@ -176,6 +211,7 @@ def test_registered_user_without_case_assignment_cannot_upload():
         },
     )
     assert response.status_code == 403
+    assert storage.objects == {}
 
 
 def test_evidence_uuid_does_not_bypass_case_membership():
@@ -206,3 +242,79 @@ def test_evidence_uuid_does_not_bypass_case_membership():
             headers={"Authorization": f"Bearer {token}"},
         )
     assert verification.status_code == 404
+
+
+def test_admin_can_provision_case_membership_but_cannot_verify_evidence():
+    client, _ = make_client(actor_role="ADMIN")
+    registration = client.post(
+        "/api/v1/auth/register",
+        json={"email": "assigned@example.test", "password": "correct horse battery"},
+    )
+    target_id = registration.json()["id"]
+    admin_headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+
+    case = client.post(
+        "/api/v1/admin/cases",
+        headers=admin_headers,
+        json={"case_id": "case-2", "name": "Second case"},
+    )
+    assert case.status_code == 201
+    membership = client.post(
+        "/api/v1/admin/case-memberships",
+        headers=admin_headers,
+        json={"user_id": target_id, "case_id": "case-2"},
+    )
+    assert membership.status_code == 201
+    duplicate = client.post(
+        "/api/v1/admin/case-memberships",
+        headers=admin_headers,
+        json={"user_id": target_id, "case_id": "case-2"},
+    )
+    assert duplicate.status_code == 409
+    assert (
+        client.get(
+            f"/api/v1/evidence/{uuid.uuid4()}/verify",
+            headers=admin_headers,
+        ).status_code
+        == 403
+    )
+
+
+def test_non_admin_cannot_provision_membership():
+    client, _ = make_client()
+    response = client.post(
+        "/api/v1/admin/cases",
+        headers={"Authorization": "Bearer test-token-" + ("x" * 32)},
+        json={"case_id": "case-2"},
+    )
+    assert response.status_code == 403
+
+
+@pytest.mark.parametrize(
+    ("role", "verify_status", "upload_status"),
+    [
+        ("INVESTIGATOR", 404, 201),
+        ("ANALYST", 404, 403),
+        ("AUDITOR", 404, 403),
+        ("ADMIN", 403, 403),
+    ],
+)
+def test_role_permissions_are_enforced(role, verify_status, upload_status):
+    client, _ = make_client(actor_role=role)
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    verify = client.get(
+        f"/api/v1/evidence/{uuid.uuid4()}/verify",
+        headers=headers,
+    )
+    assert verify.status_code == verify_status
+
+    upload = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("sample.bin", b"original evidence", "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(b"original evidence").hexdigest(),
+        },
+    )
+    assert upload.status_code == upload_status

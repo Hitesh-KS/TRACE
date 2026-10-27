@@ -23,7 +23,15 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings
 from app.database import create_session_factory
 from app.ledger import append_event, verify_chain
-from app.models import AuthSession, Base, CaseMembership, Evidence, EvidenceLedger, User
+from app.models import (
+    AuthSession,
+    Base,
+    Case,
+    CaseMembership,
+    Evidence,
+    EvidenceLedger,
+    User,
+)
 from app.storage import ObjectStorage, StorageUnavailable
 
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -41,6 +49,17 @@ class RegisterRequest(BaseModel):
 class LoginRequest(BaseModel):
     email: str = Field(min_length=3, max_length=320)
     password: str = Field(min_length=1, max_length=256)
+
+
+class CaseRequest(BaseModel):
+    case_id: str = Field(min_length=1, max_length=200)
+    name: str | None = Field(default=None, max_length=255)
+    description: str | None = Field(default=None, max_length=5000)
+
+
+class CaseMembershipRequest(BaseModel):
+    user_id: uuid.UUID
+    case_id: str = Field(min_length=1, max_length=200)
 
 
 class Storage(Protocol):
@@ -77,6 +96,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.storage = storage
+    app.state.session_factory = sessions
 
     def token_is_valid(token: str) -> bool:
         if hmac.compare_digest(token, config.api_token):
@@ -295,6 +315,66 @@ def create_app(
     def healthz():
         return {"status": "ok"}
 
+    @app.post("/api/v1/admin/cases", status_code=201)
+    def create_case(
+        request: CaseRequest,
+        _: Annotated[User, Depends(require_roles("ADMIN"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        case_id = request.case_id.strip()
+        if session.get(Case, case_id) is not None:
+            raise HTTPException(status_code=409, detail="Case already exists")
+        case = Case(
+            case_id=case_id,
+            name=request.name,
+            description=request.description,
+            created_at=datetime.now(timezone.utc),
+        )
+        try:
+            session.add(case)
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(status_code=409, detail="Case already exists") from exc
+        return {
+            "case_id": case.case_id,
+            "name": case.name,
+            "description": case.description,
+            "created_at": case.created_at,
+        }
+
+    @app.post("/api/v1/admin/case-memberships", status_code=201)
+    def create_case_membership(
+        request: CaseMembershipRequest,
+        _: Annotated[User, Depends(require_roles("ADMIN"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        case_id = request.case_id.strip()
+        if session.get(Case, case_id) is None:
+            raise HTTPException(status_code=404, detail="Case not found")
+        user = session.get(User, request.user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(status_code=404, detail="User not found")
+        membership = CaseMembership(
+            user_id=user.id,
+            case_id=case_id,
+            created_at=datetime.now(timezone.utc),
+        )
+        try:
+            session.add(membership)
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(
+                status_code=409, detail="Case membership already exists"
+            ) from exc
+        return {
+            "id": str(membership.id),
+            "user_id": str(membership.user_id),
+            "case_id": membership.case_id,
+            "created_at": membership.created_at,
+        }
+
     @app.post("/api/v1/evidence", status_code=201)
     def upload_evidence(
         file: Annotated[UploadFile, File()],
@@ -378,10 +458,19 @@ def create_app(
             session.commit()
         except SQLAlchemyError as exc:
             session.rollback()
-            logger.exception("Evidence record commit failed for %s", evidence_id)
+            logger.exception(
+                "Evidence database commit failed after object storage write: "
+                "evidence_id=%s object_key=%s object_version_id=%s",
+                evidence_id,
+                object_key,
+                version_id,
+            )
             raise HTTPException(
                 status_code=503,
-                detail="Evidence was stored but its database record could not be committed",
+                detail=(
+                    "Evidence storage succeeded but its database record could not "
+                    "be committed; reconciliation is required"
+                ),
             ) from exc
 
         return {
