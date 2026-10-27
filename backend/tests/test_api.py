@@ -95,3 +95,40 @@ def test_upload_and_verify_stored_evidence():
     )
     assert verification.status_code == 200
     assert verification.json()["status"] == "FAIL"
+
+
+def test_register_login_me_and_logout():
+    client, _ = make_client()
+    registration = client.post(
+        "/api/v1/auth/register",
+        json={"email": "investigator@example.test", "password": "correct horse battery"},
+    )
+    assert registration.status_code == 201
+    assert registration.json()["role"] == "INVESTIGATOR"
+
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "INVESTIGATOR@example.test", "password": "correct horse battery"},
+    )
+    assert login.status_code == 200
+    token = login.json()["access_token"]
+    headers = {"Authorization": f"Bearer {token}"}
+
+    me = client.get("/api/v1/auth/me", headers=headers)
+    assert me.status_code == 200
+    assert me.json()["email"] == "investigator@example.test"
+
+    logout = client.post("/api/v1/auth/logout", headers=headers)
+    assert logout.status_code == 200
+    assert client.get("/api/v1/auth/me", headers=headers).status_code == 401
+
+
+def test_auth_rejects_duplicate_registration_and_bad_password():
+    client, _ = make_client()
+    body = {"email": "duplicate@example.test", "password": "correct horse battery"}
+    assert client.post("/api/v1/auth/register", json=body).status_code == 201
+    assert client.post("/api/v1/auth/register", json=body).status_code == 409
+    assert client.post(
+        "/api/v1/auth/login",
+        json={"email": body["email"], "password": "wrong password"},
+    ).status_code == 401
