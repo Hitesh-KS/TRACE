@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi.testclient import TestClient
 import pytest
-from sqlalchemy import create_engine, select
+from sqlalchemy import create_engine, event, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -17,6 +18,7 @@ from app.models import (
     Base,
     Case,
     CaseMembership,
+    CaseReport,
     DownloadAudit,
     Evidence,
     ForensicNote,
@@ -40,6 +42,9 @@ class MemoryStorage:
         if (key, version_id) not in self.objects:
             raise StorageUnavailable("missing object version")
         return io.BytesIO(self.objects[(key, version_id)])
+
+    def delete(self, *, key, version_id):
+        self.objects.pop((key, version_id), None)
 
 
 def make_client(*, actor_role="INVESTIGATOR"):
@@ -254,6 +259,131 @@ def test_non_analyst_and_unrelated_case_cannot_create_forensic_note():
         ).status_code
         == 404
     )
+
+
+def test_analyst_can_generate_list_retrieve_and_download_report():
+    client, storage = make_client(actor_role="ANALYST")
+    evidence_id = uuid.uuid4()
+    evidence_bytes = b"report evidence"
+    evidence_version = str(uuid.uuid4())
+    storage.objects[("evidence/report/original", evidence_version)] = evidence_bytes
+    with client.app.state.session_factory() as session:
+        session.add(
+            Evidence(
+                id=evidence_id,
+                uploader_id=uuid.UUID("00000000-0000-4000-8000-000000000002"),
+                case_id="case-1",
+                file_name="report.bin",
+                content_type="application/octet-stream",
+                file_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
+                object_key="evidence/report/original",
+                object_version_id=evidence_version,
+                status="READY",
+                byte_size=len(evidence_bytes),
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    response = client.post(
+        "/api/v1/cases/case-1/reports",
+        headers=headers,
+        json={"title": "Case examination report"},
+    )
+    assert response.status_code == 201
+    report = response.json()
+    assert report["case_id"] == "case-1"
+    assert report["file_sha256"]
+    with client.app.state.session_factory() as session:
+        stored = session.get(CaseReport, uuid.UUID(report["report_id"]))
+        assert stored is not None
+        report_bytes = storage.objects[(stored.object_key, stored.object_version_id)]
+        assert report_bytes.startswith(b"%PDF-")
+        assert hashlib.sha256(report_bytes).hexdigest() == stored.file_sha256
+        assert b"Case examination report" in report_bytes
+        assert b"report.bin" in report_bytes
+
+    listed = client.get("/api/v1/cases/case-1/reports", headers=headers)
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["report_id"] == report["report_id"]
+    retrieved = client.get(
+        f"/api/v1/reports/{report['report_id']}", headers=headers
+    )
+    assert retrieved.status_code == 200
+    downloaded = client.get(
+        f"/api/v1/reports/{report['report_id']}/download", headers=headers
+    )
+    assert downloaded.status_code == 200
+    assert downloaded.headers["content-type"] == "application/pdf"
+    assert downloaded.content == report_bytes
+
+
+def test_report_access_requires_analyst_or_auditor_case_membership():
+    investigator, _ = make_client(actor_role="INVESTIGATOR")
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    assert (
+        investigator.post(
+            "/api/v1/cases/case-1/reports",
+            headers=headers,
+            json={"title": "Denied"},
+        ).status_code
+        == 403
+    )
+    unauthenticated, _ = make_client(actor_role="ANALYST")
+    assert (
+        unauthenticated.get("/api/v1/cases/case-1/reports").status_code
+        == 401
+    )
+
+
+def test_report_generation_fails_without_evidence_object():
+    client, _ = make_client(actor_role="ANALYST")
+    with client.app.state.session_factory() as session:
+        session.add(
+            Evidence(
+                id=uuid.uuid4(),
+                case_id="case-1",
+                file_name="missing.bin",
+                content_type="application/octet-stream",
+                file_sha256="c" * 64,
+                object_key="evidence/missing/original",
+                object_version_id="missing-version",
+                status="READY",
+                byte_size=1,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    response = client.post(
+        "/api/v1/cases/case-1/reports",
+        headers=headers,
+        json={"title": "Unavailable evidence"},
+    )
+    assert response.status_code == 503
+    with client.app.state.session_factory() as session:
+        assert session.query(CaseReport).count() == 0
+
+
+def test_report_metadata_failure_removes_uploaded_object():
+    client, storage = make_client(actor_role="ANALYST")
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+
+    def fail_insert(*_args):
+        raise SQLAlchemyError("forced report persistence failure")
+
+    event.listen(CaseReport, "before_insert", fail_insert)
+    try:
+        response = client.post(
+            "/api/v1/cases/case-1/reports",
+            headers=headers,
+            json={"title": "Persistence failure"},
+        )
+    finally:
+        event.remove(CaseReport, "before_insert", fail_insert)
+    assert response.status_code == 503
+    assert not any(key.startswith("reports/") for key, _ in storage.objects)
 
 
 def test_register_login_me_and_logout():

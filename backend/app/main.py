@@ -7,6 +7,7 @@ import tempfile
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Annotated, BinaryIO, Protocol
 from os.path import basename
 from urllib.parse import quote
@@ -18,6 +19,17 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from reportlab.lib import colors
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
@@ -34,6 +46,7 @@ from app.models import (
     Evidence,
     EvidenceLedger,
     ForensicNote,
+    CaseReport,
     User,
 )
 from app.storage import ObjectStorage, StorageUnavailable
@@ -71,12 +84,18 @@ class ForensicNoteRequest(BaseModel):
     content: str = Field(min_length=1, max_length=50000)
 
 
+class ReportRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=255)
+
+
 class Storage(Protocol):
     def put(
         self, *, key: str, body: BinaryIO, content_length: int, content_type: str
     ) -> str: ...
 
     def get(self, *, key: str, version_id: str) -> BinaryIO: ...
+
+    def delete(self, *, key: str, version_id: str) -> None: ...
 
 
 def create_app(
@@ -262,6 +281,141 @@ def create_app(
             "content": note.content,
             "created_at": note.created_at,
         }
+
+    def report_response(report: CaseReport) -> dict:
+        return {
+            "report_id": str(report.id),
+            "case_id": report.case_id,
+            "title": report.title,
+            "creator_id": str(report.creator_id),
+            "created_at": report.created_at,
+            "file_sha256": report.file_sha256,
+            "object_version_id": report.object_version_id,
+            "byte_size": report.byte_size,
+        }
+
+    def build_report_pdf(
+        *,
+        report_id: uuid.UUID,
+        title: str,
+        creator: User,
+        case: Case,
+        evidence: list[Evidence],
+        notes: list[ForensicNote],
+        ledger_events: list[EvidenceLedger],
+        verification_results: dict[uuid.UUID, str],
+    ) -> bytes:
+        buffer = BytesIO()
+        styles = getSampleStyleSheet()
+        body = styles["BodyText"]
+        body.leading = 11
+        story = [
+            Paragraph(title, styles["Title"]),
+            Paragraph(f"Report ID: {report_id}", body),
+            Paragraph(f"Created by: {creator.email} ({creator.id})", body),
+            Paragraph(f"Created at: {datetime.now(timezone.utc).isoformat()}", body),
+            Spacer(1, 0.18 * inch),
+            Paragraph("Case", styles["Heading2"]),
+            Paragraph(
+                f"{case.case_id} - {case.name or 'Unnamed case'}<br/>{case.description or 'No description available.'}",
+                body,
+            ),
+            Spacer(1, 0.12 * inch),
+            Paragraph("Evidence inventory", styles["Heading2"]),
+        ]
+        evidence_rows = [["Evidence ID", "Filename", "SHA-256", "Verification"]]
+        for item in evidence:
+            evidence_rows.append(
+                [
+                    str(item.id),
+                    item.file_name,
+                    item.file_sha256,
+                    verification_results.get(item.id, "NOT CHECKED"),
+                ]
+            )
+        evidence_table = Table(evidence_rows, repeatRows=1, colWidths=[1.35 * inch, 1.15 * inch, 2.15 * inch, 1.05 * inch])
+        evidence_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9e2f3")),
+                    ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        story.extend([evidence_table, Spacer(1, 0.12 * inch)])
+        story.append(Paragraph("Custody ledger entries", styles["Heading2"]))
+        ledger_rows = [["Timestamp", "Action", "Actor", "Hash"]]
+        for event in ledger_events:
+            ledger_rows.append(
+                [
+                    event.timestamp.isoformat(),
+                    event.action_type,
+                    str(event.actor_id),
+                    event.current_block_hash,
+                ]
+            )
+        ledger_table = Table(ledger_rows, repeatRows=1, colWidths=[1.25 * inch, 0.85 * inch, 1.55 * inch, 2.05 * inch])
+        ledger_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9e2f3")),
+                    ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                ]
+            )
+        )
+        story.extend([ledger_table, Spacer(1, 0.12 * inch)])
+        story.append(Paragraph("Forensic notes", styles["Heading2"]))
+        if notes:
+            for note in notes:
+                story.extend(
+                    [
+                        Paragraph(f"{note.title} - {note.created_at.isoformat()}", styles["Heading3"]),
+                        Paragraph(f"Author: {note.analyst_id}", body),
+                        Paragraph(note.content.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\n", "<br/>"), body),
+                        Spacer(1, 0.08 * inch),
+                    ]
+                )
+        else:
+            story.append(Paragraph("No forensic notes are recorded.", body))
+        story.append(Paragraph("Report integrity", styles["Heading2"]))
+        story.append(
+            Paragraph(
+                "The SHA-256 value returned with the report metadata is calculated over the final PDF bytes. It is not embedded here to avoid a circular hash dependency.",
+                body,
+            )
+        )
+        SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            pageCompression=0,
+            rightMargin=0.45 * inch,
+            leftMargin=0.45 * inch,
+            topMargin=0.5 * inch,
+            bottomMargin=0.5 * inch,
+        ).build(story)
+        return buffer.getvalue()
+
+    def get_authorized_case(
+        case_id: str, user: User, session: Session
+    ) -> Case:
+        case = session.get(Case, case_id)
+        if case is None or not user_has_case_access(
+            session, user_id=user.id, case_id=case_id
+        ):
+            raise HTTPException(status_code=404, detail="Case not found")
+        return case
+
+    def get_authorized_report(
+        report_id: uuid.UUID, user: User, session: Session
+    ) -> CaseReport:
+        report = session.get(CaseReport, report_id)
+        if report is None:
+            raise HTTPException(status_code=404, detail="Report not found")
+        get_authorized_case(report.case_id, user, session)
+        return report
 
     def auth_response(token: str, user: User, expires_at: datetime):
         return {
@@ -468,6 +622,164 @@ def create_app(
         if note is None:
             raise HTTPException(status_code=404, detail="Forensic note not found")
         return forensic_note_response(note)
+
+    @app.post("/api/v1/cases/{case_id}/reports", status_code=201)
+    def create_report(
+        case_id: str,
+        request: ReportRequest,
+        creator: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        case = get_authorized_case(case_id.strip(), creator, session)
+        evidence = list(
+            session.scalars(
+                select(Evidence)
+                .where(Evidence.case_id == case.case_id)
+                .order_by(Evidence.created_at, Evidence.id)
+            )
+        )
+        evidence_ids = [item.id for item in evidence]
+        notes = list(
+            session.scalars(
+                select(ForensicNote)
+                .where(ForensicNote.case_id == case.case_id)
+                .order_by(ForensicNote.created_at, ForensicNote.id)
+            )
+        )
+        ledger_events = list(
+            session.scalars(
+                select(EvidenceLedger)
+                .where(EvidenceLedger.evidence_id.in_(evidence_ids))
+                .order_by(EvidenceLedger.timestamp, EvidenceLedger.sequence)
+            )
+        ) if evidence_ids else []
+        verification_results: dict[uuid.UUID, str] = {}
+        for item in evidence:
+            try:
+                body = app.state.storage.get(
+                    key=item.object_key, version_id=item.object_version_id
+                )
+                digest = hashlib.sha256()
+                while chunk := body.read(CHUNK_SIZE):
+                    digest.update(chunk)
+                body.close()
+                verification_results[item.id] = (
+                    "PASS"
+                    if hmac.compare_digest(digest.hexdigest(), item.file_sha256)
+                    else "FAIL"
+                )
+            except (BotoCoreError, StorageUnavailable, RuntimeError) as exc:
+                logger.exception("Report evidence verification failed for %s", item.id)
+                raise HTTPException(
+                    status_code=503, detail="Evidence storage is unavailable"
+                ) from exc
+
+        report_id = uuid.uuid4()
+        pdf_bytes = build_report_pdf(
+            report_id=report_id,
+            title=request.title.strip(),
+            creator=creator,
+            case=case,
+            evidence=evidence,
+            notes=notes,
+            ledger_events=ledger_events,
+            verification_results=verification_results,
+        )
+        object_key = f"reports/{case.case_id}/{report_id}.pdf"
+        try:
+            version_id = app.state.storage.put(
+                key=object_key,
+                body=BytesIO(pdf_bytes),
+                content_length=len(pdf_bytes),
+                content_type="application/pdf",
+            )
+        except (BotoCoreError, StorageUnavailable, RuntimeError) as exc:
+            logger.exception("Report PDF upload failed for %s", report_id)
+            raise HTTPException(
+                status_code=503, detail="Report storage is unavailable"
+            ) from exc
+
+        report = CaseReport(
+            id=report_id,
+            case_id=case.case_id,
+            title=request.title.strip(),
+            creator_id=creator.id,
+            created_at=datetime.now(timezone.utc),
+            file_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
+            object_key=object_key,
+            object_version_id=version_id,
+            byte_size=len(pdf_bytes),
+        )
+        try:
+            session.add(report)
+            session.commit()
+        except SQLAlchemyError as exc:
+            session.rollback()
+            try:
+                app.state.storage.delete(key=object_key, version_id=version_id)
+            except (BotoCoreError, StorageUnavailable, RuntimeError):
+                logger.exception("Report orphan cleanup failed for %s", report_id)
+            logger.exception("Report metadata commit failed for %s", report_id)
+            raise HTTPException(
+                status_code=503, detail="Report metadata could not be saved"
+            ) from exc
+        return report_response(report)
+
+    @app.get("/api/v1/cases/{case_id}/reports")
+    def list_reports(
+        case_id: str,
+        user: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        case = get_authorized_case(case_id.strip(), user, session)
+        reports = session.scalars(
+            select(CaseReport)
+            .where(CaseReport.case_id == case.case_id)
+            .order_by(CaseReport.created_at.desc(), CaseReport.id.desc())
+        )
+        return {"items": [report_response(report) for report in reports]}
+
+    @app.get("/api/v1/reports/{report_id}")
+    def get_report(
+        report_id: uuid.UUID,
+        user: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        return report_response(get_authorized_report(report_id, user, session))
+
+    @app.get("/api/v1/reports/{report_id}/download")
+    def download_report(
+        report_id: uuid.UUID,
+        user: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        report = get_authorized_report(report_id, user, session)
+        try:
+            object_body = app.state.storage.get(
+                key=report.object_key, version_id=report.object_version_id
+            )
+        except (BotoCoreError, StorageUnavailable, RuntimeError) as exc:
+            logger.exception("Report download failed for %s", report_id)
+            raise HTTPException(
+                status_code=503, detail="Report storage is unavailable"
+            ) from exc
+
+        def stream():
+            try:
+                while chunk := object_body.read(CHUNK_SIZE):
+                    yield chunk
+            finally:
+                object_body.close()
+
+        return StreamingResponse(
+            stream(),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": f'attachment; filename="report-{report.id}.pdf"',
+                "Content-Length": str(report.byte_size),
+                "X-Content-Type-Options": "nosniff",
+            },
+        )
 
     @app.get("/api/v1/evidence/{evidence_id}/download")
     def download_evidence(

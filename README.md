@@ -84,6 +84,23 @@ notes through `/api/v1/evidence/{evidence_id}/notes`; the API derives the
 case and author from the authorized evidence and authenticated session. Notes
 do not modify evidence hashes or append custody-ledger events.
 
+Migration `0006_case_reports` adds report metadata storage. Analysts and
+auditors with case membership can generate, list, retrieve, and download
+ReportLab PDF reports through:
+
+```text
+POST /api/v1/cases/{case_id}/reports
+GET  /api/v1/cases/{case_id}/reports
+GET  /api/v1/reports/{report_id}
+GET  /api/v1/reports/{report_id}/download
+```
+
+PDF bytes are stored in MinIO and metadata plus the final PDF SHA-256 digest
+are stored in PostgreSQL. Report generation verifies each exact evidence
+object version before including its result. If database persistence fails
+after PDF upload, the API attempts to remove the newly uploaded object and
+logs cleanup failures.
+
 The local stack uses MinIO with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The MinIO console is at `http://localhost:9001`.
 
 ## Backend endpoint authorization
