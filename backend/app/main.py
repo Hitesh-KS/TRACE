@@ -23,7 +23,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from app.config import Settings
 from app.database import create_session_factory
 from app.ledger import append_event, verify_chain
-from app.models import AuthSession, Base, Evidence, EvidenceLedger, User
+from app.models import AuthSession, Base, CaseMembership, Evidence, EvidenceLedger, User
 from app.storage import ObjectStorage, StorageUnavailable
 
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
@@ -167,10 +167,48 @@ def create_app(
             )
         return user
 
-    def require_auth(
-        user: Annotated[User, Depends(get_authenticated_user)],
-    ) -> uuid.UUID:
-        return user.id
+    def require_roles(*roles: str):
+        def dependency(
+            user: Annotated[User, Depends(get_authenticated_user)],
+        ) -> User:
+            if user.role not in roles:
+                raise HTTPException(
+                    status_code=403, detail="Insufficient permissions"
+                )
+            return user
+
+        return dependency
+
+    def user_has_case_access(
+        session: Session, *, user_id: uuid.UUID, case_id: str
+    ) -> bool:
+        return (
+            session.scalar(
+                select(CaseMembership.id).where(
+                    CaseMembership.user_id == user_id,
+                    CaseMembership.case_id == case_id,
+                )
+            )
+            is not None
+        )
+
+    def get_authorized_evidence(
+        evidence_id: uuid.UUID, user: User, session: Session
+    ) -> Evidence:
+        evidence = session.scalar(
+            select(Evidence)
+            .join(
+                CaseMembership,
+                CaseMembership.case_id == Evidence.case_id,
+            )
+            .where(
+                Evidence.id == evidence_id,
+                CaseMembership.user_id == user.id,
+            )
+        )
+        if evidence is None:
+            raise HTTPException(status_code=404, detail="Evidence not found")
+        return evidence
 
     def auth_response(token: str, user: User, expires_at: datetime):
         return {
@@ -262,9 +300,14 @@ def create_app(
         file: Annotated[UploadFile, File()],
         case_id: Annotated[str, Form(min_length=1, max_length=200)],
         client_sha256: Annotated[str, Form()],
-        actor_id: Annotated[uuid.UUID, Depends(require_auth)],
+        user: Annotated[User, Depends(require_roles("INVESTIGATOR"))],
         session: Annotated[Session, Depends(get_db)],
     ):
+        if not user_has_case_access(
+            session, user_id=user.id, case_id=case_id.strip()
+        ):
+            raise HTTPException(status_code=403, detail="Case access is required")
+        case_id = case_id.strip()
         if not SHA256_PATTERN.fullmatch(client_sha256):
             raise HTTPException(
                 status_code=400, detail="client_sha256 must be a SHA-256 hex digest"
@@ -325,7 +368,7 @@ def create_app(
                 session,
                 evidence=evidence,
                 action_type="INGEST",
-                actor_id=actor_id,
+                actor_id=user.id,
                 metadata={
                     "byte_size": byte_size,
                     "case_id": case_id,
@@ -354,12 +397,12 @@ def create_app(
     @app.get("/api/v1/evidence/{evidence_id}/verify")
     def verify_evidence(
         evidence_id: uuid.UUID,
-        actor_id: Annotated[uuid.UUID, Depends(require_auth)],
+        user: Annotated[
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "AUDITOR"))
+        ],
         session: Annotated[Session, Depends(get_db)],
     ):
-        evidence = session.get(Evidence, evidence_id)
-        if evidence is None:
-            raise HTTPException(status_code=404, detail="Evidence not found")
+        evidence = get_authorized_evidence(evidence_id, user, session)
         blocks = list(
             session.scalars(
                 select(EvidenceLedger)
@@ -406,7 +449,7 @@ def create_app(
                 session,
                 evidence=evidence,
                 action_type="VERIFY",
-                actor_id=actor_id,
+                actor_id=user.id,
                 metadata={
                     "computed_hash": computed_hash,
                     "result": "PASS" if passed else "FAIL",

@@ -56,6 +56,21 @@ class AuthSession(Base):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class CaseMembership(Base):
+    __tablename__ = "case_memberships"
+    __table_args__ = (
+        UniqueConstraint("user_id", "case_id", name="uq_case_memberships_user_case"),
+        Index("ix_case_memberships_case_user", "case_id", "user_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    case_id: Mapped[str] = mapped_column(String(200), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class Evidence(Base):
     __tablename__ = "evidence"
 

@@ -4,7 +4,7 @@ TRACE stands for **Tamper-proof Record Archive for Cryptographic Evidence**. It 
 
 > **Development status:** This is an early development build, not a production or legal-compliance certification. The local Compose credentials are for development only. Authentication is a single configured bearer token and actor identity; production requires an identity provider, per-user authorization, security review, database migrations, monitoring, recovery procedures, and jurisdiction-specific legal review.
 
-The current slice does not yet include a web UI, per-user/case authorization, metadata extraction, PDF reports, externally anchored ledger checkpoints, or ingest idempotency/reconciliation.
+The current slice does not yet include a web UI, metadata extraction, PDF reports, externally anchored ledger checkpoints, or ingest idempotency/reconciliation. Evidence access is scoped to explicit database-backed case memberships; unassigned users fail closed.
 
 ## Run locally
 
@@ -41,7 +41,24 @@ curl -X POST http://localhost:8000/api/v1/auth/login \
 Use the returned `access_token` as a bearer token for `/api/v1/auth/me` and
 evidence endpoints. `POST /api/v1/auth/logout` revokes the current session.
 The configured `TRACE_API_TOKEN` remains available for local development and
-maps to `TRACE_ACTOR_ID`; it is not production authentication.
+maps to `TRACE_ACTOR_ID`; it is not production authentication. The configured
+actor must also have a row in `case_memberships` to access evidence.
+
+### Case authorization
+
+`case_memberships` associates a user UUID with a case ID. Registration never
+creates memberships, and `ADMIN` is not an evidence-access bypass. Provision
+case memberships through a reviewed administrative/database setup process before
+an account can upload, verify, or inspect evidence for that case. Existing
+evidence without an established membership is inaccessible through the API.
+
+The development app extends the schema with `Base.metadata.create_all`. Before
+using an existing PostgreSQL database in a managed environment, apply an
+equivalent forward-only migration: create `case_memberships` with a UUID
+foreign key to `users(id)` using `ON DELETE CASCADE`, a unique constraint on
+`(user_id, case_id)`, and an index on `(case_id, user_id)`. Then add only
+reviewed membership rows. Do not backfill every existing user or grant
+membership based on the `case_id` stored on evidence.
 
 The local stack uses RustFS with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance with disk checks bypassed; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The RustFS console is at `http://localhost:9001`.
 
