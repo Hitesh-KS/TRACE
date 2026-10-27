@@ -56,6 +56,19 @@ CHUNK_SIZE = 1024 * 1024
 bearer_scheme = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
 password_hasher = PasswordHasher()
+REPORT_TYPES = {
+    "EVIDENCE_REGISTRATION",
+    "CHAIN_OF_CUSTODY",
+    "INTEGRITY_VERIFICATION",
+    "FORENSIC_EXAMINATION",
+    "JUDICIAL_REVIEW",
+}
+REPORT_TYPES_BY_ROLE = {
+    "INVESTIGATOR": {"EVIDENCE_REGISTRATION", "CHAIN_OF_CUSTODY", "INTEGRITY_VERIFICATION"},
+    "ANALYST": {"FORENSIC_EXAMINATION", "CHAIN_OF_CUSTODY", "INTEGRITY_VERIFICATION"},
+    "JUDGE": {"JUDICIAL_REVIEW", "CHAIN_OF_CUSTODY", "INTEGRITY_VERIFICATION"},
+    "AUDITOR": REPORT_TYPES,
+}
 
 
 class RegisterRequest(BaseModel):
@@ -86,6 +99,7 @@ class ForensicNoteRequest(BaseModel):
 
 class ReportRequest(BaseModel):
     title: str = Field(min_length=1, max_length=255)
+    report_type: str = Field(default="FORENSIC_EXAMINATION", min_length=1, max_length=64)
 
 
 class Storage(Protocol):
@@ -287,6 +301,7 @@ def create_app(
             "report_id": str(report.id),
             "case_id": report.case_id,
             "title": report.title,
+            "report_type": report.report_type,
             "creator_id": str(report.creator_id),
             "created_at": report.created_at,
             "file_sha256": report.file_sha256,
@@ -304,6 +319,7 @@ def create_app(
         notes: list[ForensicNote],
         ledger_events: list[EvidenceLedger],
         verification_results: dict[uuid.UUID, str],
+        report_type: str,
     ) -> bytes:
         buffer = BytesIO()
         styles = getSampleStyleSheet()
@@ -311,6 +327,7 @@ def create_app(
         body.leading = 11
         story = [
             Paragraph(title, styles["Title"]),
+            Paragraph(f"Report type: {report_type}", body),
             Paragraph(f"Report ID: {report_id}", body),
             Paragraph(f"Created by: {creator.email} ({creator.id})", body),
             Paragraph(f"Created at: {datetime.now(timezone.utc).isoformat()}", body),
@@ -415,6 +432,8 @@ def create_app(
         if report is None:
             raise HTTPException(status_code=404, detail="Report not found")
         get_authorized_case(report.case_id, user, session)
+        if user.role not in REPORT_TYPES_BY_ROLE or report.report_type not in REPORT_TYPES_BY_ROLE[user.role]:
+            raise HTTPException(status_code=404, detail="Report not found")
         return report
 
     def auth_response(token: str, user: User, expires_at: datetime):
@@ -627,9 +646,12 @@ def create_app(
     def create_report(
         case_id: str,
         request: ReportRequest,
-        creator: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        creator: Annotated[User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))],
         session: Annotated[Session, Depends(get_db)],
     ):
+        report_type = request.report_type.strip().upper()
+        if report_type not in REPORT_TYPES or report_type not in REPORT_TYPES_BY_ROLE.get(creator.role, set()):
+            raise HTTPException(status_code=403, detail="Report type is not permitted for this role")
         case = get_authorized_case(case_id.strip(), creator, session)
         evidence = list(
             session.scalars(
@@ -645,7 +667,7 @@ def create_app(
                 .where(ForensicNote.case_id == case.case_id)
                 .order_by(ForensicNote.created_at, ForensicNote.id)
             )
-        )
+        ) if creator.role in {"ANALYST", "JUDGE", "AUDITOR"} else []
         ledger_events = list(
             session.scalars(
                 select(EvidenceLedger)
@@ -684,6 +706,7 @@ def create_app(
             notes=notes,
             ledger_events=ledger_events,
             verification_results=verification_results,
+            report_type=report_type,
         )
         object_key = f"reports/{case.case_id}/{report_id}.pdf"
         try:
@@ -703,6 +726,7 @@ def create_app(
             id=report_id,
             case_id=case.case_id,
             title=request.title.strip(),
+            report_type=report_type,
             creator_id=creator.id,
             created_at=datetime.now(timezone.utc),
             file_sha256=hashlib.sha256(pdf_bytes).hexdigest(),
@@ -728,7 +752,7 @@ def create_app(
     @app.get("/api/v1/cases/{case_id}/reports")
     def list_reports(
         case_id: str,
-        user: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        user: Annotated[User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))],
         session: Annotated[Session, Depends(get_db)],
     ):
         case = get_authorized_case(case_id.strip(), user, session)
@@ -737,12 +761,12 @@ def create_app(
             .where(CaseReport.case_id == case.case_id)
             .order_by(CaseReport.created_at.desc(), CaseReport.id.desc())
         )
-        return {"items": [report_response(report) for report in reports]}
+        return {"items": [report_response(report) for report in reports if report.report_type in REPORT_TYPES_BY_ROLE.get(user.role, set())]}
 
     @app.get("/api/v1/reports/{report_id}")
     def get_report(
         report_id: uuid.UUID,
-        user: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        user: Annotated[User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))],
         session: Annotated[Session, Depends(get_db)],
     ):
         return report_response(get_authorized_report(report_id, user, session))
@@ -750,7 +774,7 @@ def create_app(
     @app.get("/api/v1/reports/{report_id}/download")
     def download_report(
         report_id: uuid.UUID,
-        user: Annotated[User, Depends(require_roles("ANALYST", "AUDITOR"))],
+        user: Annotated[User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))],
         session: Annotated[Session, Depends(get_db)],
     ):
         report = get_authorized_report(report_id, user, session)
@@ -777,6 +801,7 @@ def create_app(
             headers={
                 "Content-Disposition": f'attachment; filename="report-{report.id}.pdf"',
                 "Content-Length": str(report.byte_size),
+                "X-Report-SHA256": report.file_sha256,
                 "X-Content-Type-Options": "nosniff",
             },
         )

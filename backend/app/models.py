@@ -29,7 +29,7 @@ class User(Base):
     __table_args__ = (
         UniqueConstraint("email", name="uq_users_email"),
         CheckConstraint(
-            "role IN ('INVESTIGATOR', 'ANALYST', 'AUDITOR', 'ADMIN')",
+            "role IN ('INVESTIGATOR', 'ANALYST', 'JUDGE', 'AUDITOR', 'ADMIN')",
             name="ck_users_role",
         ),
     )
@@ -173,6 +173,7 @@ class CaseReport(Base):
         String(200), ForeignKey("cases.case_id", ondelete="RESTRICT"), nullable=False
     )
     title: Mapped[str] = mapped_column(String(255), nullable=False)
+    report_type: Mapped[str] = mapped_column(String(64), nullable=False, default="FORENSIC_EXAMINATION")
     creator_id: Mapped[uuid.UUID] = mapped_column(
         Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
     )

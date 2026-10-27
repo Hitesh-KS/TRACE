@@ -4,7 +4,7 @@ TRACE stands for **Tamper-proof Record Archive for Cryptographic Evidence**. It 
 
 > **Development status:** This is an early development build, not a production or legal-compliance certification. The local Compose credentials are for development only. Authentication is a single configured bearer token and actor identity; production requires an identity provider, per-user authorization, security review, database migrations, monitoring, recovery procedures, and jurisdiction-specific legal review.
 
-The current slice does not yet include a web UI, metadata extraction, PDF reports, externally anchored ledger checkpoints, or ingest idempotency/reconciliation. Evidence access is scoped to explicit database-backed case memberships; unassigned users fail closed.
+The current slice does not yet include metadata extraction, externally anchored ledger checkpoints, or ingest idempotency/reconciliation. Evidence access is scoped to explicit database-backed case memberships; unassigned users fail closed.
 
 ## Run locally
 
@@ -84,9 +84,14 @@ notes through `/api/v1/evidence/{evidence_id}/notes`; the API derives the
 case and author from the authorized evidence and authenticated session. Notes
 do not modify evidence hashes or append custody-ledger events.
 
-Migration `0006_case_reports` adds report metadata storage. Analysts and
-auditors with case membership can generate, list, retrieve, and download
-ReportLab PDF reports through:
+Migration `0006_case_reports` adds report metadata storage. Migration
+`0007_report_types_and_judge` adds an explicit report type and the `JUDGE`
+role constraint. With case membership, investigators can generate evidence
+registration, custody, and integrity reports; analysts can generate forensic
+examination, custody, and integrity reports; and judges can generate judicial
+review, custody, and integrity reports. Auditors retain access to all report
+types. Report listing, retrieval, and download are filtered by the same
+server-side role allowlist.
 
 ```text
 POST /api/v1/cases/{case_id}/reports
