@@ -16,6 +16,7 @@ class Settings:
     object_lock_mode: str
     object_retention_days: int
     max_upload_bytes: int
+    auth_session_days: int
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -36,6 +37,7 @@ class Settings:
             object_lock_mode=os.getenv("OBJECT_LOCK_MODE", "COMPLIANCE").upper(),
             object_retention_days=int(os.getenv("OBJECT_RETENTION_DAYS", "365")),
             max_upload_bytes=int(os.getenv("MAX_UPLOAD_BYTES", str(10 * 1024**3))),
+            auth_session_days=int(os.getenv("AUTH_SESSION_DAYS", "7")),
         )
 
     def validate(self) -> None:
@@ -51,3 +53,5 @@ class Settings:
             raise RuntimeError("OBJECT_RETENTION_DAYS must be positive")
         if self.max_upload_bytes < 1:
             raise RuntimeError("MAX_UPLOAD_BYTES must be positive")
+        if self.auth_session_days < 1:
+            raise RuntimeError("AUTH_SESSION_DAYS must be positive")

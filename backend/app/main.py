@@ -2,30 +2,45 @@ import hashlib
 import hmac
 import logging
 import re
+import secrets
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Annotated, BinaryIO, Protocol
 
+from argon2 import PasswordHasher
+from argon2.exceptions import InvalidHashError, VerificationError, VerifyMismatchError
 from botocore.exceptions import BotoCoreError
 from fastapi import Depends, FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 from sqlalchemy import select
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from app.config import Settings
 from app.database import create_session_factory
 from app.ledger import append_event, verify_chain
-from app.models import Base, Evidence, EvidenceLedger
+from app.models import AuthSession, Base, Evidence, EvidenceLedger, User
 from app.storage import ObjectStorage, StorageUnavailable
 
 SHA256_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 CHUNK_SIZE = 1024 * 1024
 bearer_scheme = HTTPBearer(auto_error=False)
 logger = logging.getLogger(__name__)
+password_hasher = PasswordHasher()
+
+
+class RegisterRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=12, max_length=256)
+
+
+class LoginRequest(BaseModel):
+    email: str = Field(min_length=3, max_length=320)
+    password: str = Field(min_length=1, max_length=256)
 
 
 class Storage(Protocol):
@@ -63,14 +78,31 @@ def create_app(
     )
     app.state.storage = storage
 
+    def token_is_valid(token: str) -> bool:
+        if hmac.compare_digest(token, config.api_token):
+            return True
+        token_hash = hashlib.sha256(token.encode("utf-8")).hexdigest()
+        with sessions() as session:
+            auth_session = session.scalar(
+                select(AuthSession).where(AuthSession.token_hash == token_hash)
+            )
+            if auth_session is None or auth_session.revoked_at is not None:
+                return False
+            expires_at = auth_session.expires_at
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            return expires_at > datetime.now(timezone.utc)
+
     @app.middleware("http")
     async def authenticate_before_body(request, call_next):
-        if request.url.path.startswith("/api/"):
+        if request.url.path.startswith("/api/") and not request.url.path.startswith(
+            "/api/v1/auth/"
+        ):
             authorization = request.headers.get("authorization", "").split()
             if (
                 len(authorization) != 2
                 or authorization[0].lower() != "bearer"
-                or not hmac.compare_digest(authorization[1], config.api_token)
+                or not token_is_valid(authorization[1])
             ):
                 return JSONResponse(
                     {"detail": "Invalid or missing bearer token"},
@@ -83,22 +115,143 @@ def create_app(
         with sessions() as session:
             yield session
 
-    def require_auth(
+    def get_authenticated_user(
         credentials: Annotated[
             HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
         ],
-    ) -> uuid.UUID:
-        if (
-            credentials is None
-            or credentials.scheme.lower() != "bearer"
-            or not hmac.compare_digest(credentials.credentials, config.api_token)
-        ):
+        session: Annotated[Session, Depends(get_db)],
+    ) -> User:
+        if credentials is None or credentials.scheme.lower() != "bearer":
             raise HTTPException(
                 status_code=401,
                 detail="Invalid or missing bearer token",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        return uuid.UUID(config.actor_id)
+        if hmac.compare_digest(credentials.credentials, config.api_token):
+            user_id = uuid.UUID(config.actor_id)
+            user = session.get(User, user_id)
+            if user is not None and user.is_active:
+                return user
+            return User(
+                id=user_id,
+                email="configured-actor@local",
+                role="ADMIN",
+                is_active=True,
+                created_at=datetime.now(timezone.utc),
+            )
+        token_hash = hashlib.sha256(credentials.credentials.encode("utf-8")).hexdigest()
+        auth_session = session.scalar(
+            select(AuthSession).where(AuthSession.token_hash == token_hash)
+        )
+        if auth_session is None or auth_session.revoked_at is not None:
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid or missing bearer token",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        expires_at = auth_session.expires_at
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(tzinfo=timezone.utc)
+        if expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication session has expired",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user = session.get(User, auth_session.user_id)
+        if user is None or not user.is_active:
+            raise HTTPException(
+                status_code=401,
+                detail="User account is inactive",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user
+
+    def require_auth(
+        user: Annotated[User, Depends(get_authenticated_user)],
+    ) -> uuid.UUID:
+        return user.id
+
+    def auth_response(token: str, user: User, expires_at: datetime):
+        return {
+            "access_token": token,
+            "token_type": "bearer",
+            "expires_at": expires_at,
+            "user": {
+                "id": str(user.id),
+                "email": user.email,
+                "role": user.role,
+            },
+        }
+
+    @app.post("/api/v1/auth/register", status_code=201)
+    def register(request: RegisterRequest, session: Annotated[Session, Depends(get_db)]):
+        email = request.email.strip().lower()
+        if "@" not in email:
+            raise HTTPException(status_code=422, detail="email must be valid")
+        user = User(
+            email=email,
+            password_hash=password_hasher.hash(request.password),
+            role="INVESTIGATOR",
+            is_active=True,
+            created_at=datetime.now(timezone.utc),
+        )
+        try:
+            session.add(user)
+            session.commit()
+        except IntegrityError as exc:
+            session.rollback()
+            raise HTTPException(status_code=409, detail="Email is already registered") from exc
+        return {"id": str(user.id), "email": user.email, "role": user.role}
+
+    @app.post("/api/v1/auth/login")
+    def login(request: LoginRequest, session: Annotated[Session, Depends(get_db)]):
+        user = session.scalar(
+            select(User).where(User.email == request.email.strip().lower())
+        )
+        if user is None or not user.is_active:
+            raise HTTPException(status_code=401, detail="Invalid email or password")
+        try:
+            password_hasher.verify(user.password_hash, request.password)
+        except (VerifyMismatchError, VerificationError, InvalidHashError) as exc:
+            raise HTTPException(status_code=401, detail="Invalid email or password") from exc
+        token = secrets.token_urlsafe(32)
+        now = datetime.now(timezone.utc)
+        expires_at = now + timedelta(days=config.auth_session_days)
+        session.add(
+            AuthSession(
+                user_id=user.id,
+                token_hash=hashlib.sha256(token.encode("utf-8")).hexdigest(),
+                created_at=now,
+                expires_at=expires_at,
+            )
+        )
+        session.commit()
+        return auth_response(token, user, expires_at)
+
+    @app.post("/api/v1/auth/logout")
+    def logout(
+        credentials: Annotated[
+            HTTPAuthorizationCredentials | None, Depends(bearer_scheme)
+        ],
+        _: Annotated[User, Depends(get_authenticated_user)],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        if credentials is not None and not hmac.compare_digest(
+            credentials.credentials, config.api_token
+        ):
+            token_hash = hashlib.sha256(credentials.credentials.encode("utf-8")).hexdigest()
+            auth_session = session.scalar(
+                select(AuthSession).where(AuthSession.token_hash == token_hash)
+            )
+            if auth_session is not None and auth_session.revoked_at is None:
+                auth_session.revoked_at = datetime.now(timezone.utc)
+                session.commit()
+        return {"status": "logged_out"}
+
+    @app.get("/api/v1/auth/me")
+    def me(user: Annotated[User, Depends(get_authenticated_user)]):
+        return {"id": str(user.id), "email": user.email, "role": user.role}
 
     @app.get("/healthz")
     def healthz():

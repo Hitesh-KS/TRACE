@@ -22,6 +22,27 @@ docker compose up --build
 
 Open the dashboard at `http://localhost:3000`. The API is available at `http://localhost:8000`; interactive API documentation is at `http://localhost:8000/docs`. The dashboard displays live API health and empty states until evidence is added.
 
+### Authentication
+
+The API supports database-backed accounts with Argon2id password hashing and
+short-lived bearer sessions. Registration creates an `INVESTIGATOR` account;
+role elevation is not available through public registration.
+
+```bash
+curl -X POST http://localhost:8000/api/v1/auth/register \
+  -H "Content-Type: application/json" \
+  -d '{"email":"investigator@example.test","password":"a-password-at-least-12-characters"}'
+
+curl -X POST http://localhost:8000/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"investigator@example.test","password":"a-password-at-least-12-characters"}'
+```
+
+Use the returned `access_token` as a bearer token for `/api/v1/auth/me` and
+evidence endpoints. `POST /api/v1/auth/logout` revokes the current session.
+The configured `TRACE_API_TOKEN` remains available for local development and
+maps to `TRACE_ACTOR_ID`; it is not production authentication.
+
 The local stack uses RustFS with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance with disk checks bypassed; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The RustFS console is at `http://localhost:9001`.
 
 ## Upload evidence
