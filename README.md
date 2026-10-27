@@ -1,6 +1,6 @@
 # TRACE
 
-TRACE is a digital evidence vault. The initial application includes a Next.js investigator dashboard and a FastAPI backend for authenticated evidence upload, independent server-side SHA-256 calculation, versioned S3-compatible object storage with retention settings, and a per-evidence hash-linked custody ledger with stored-object verification.
+TRACE stands for **Tamper-proof Record Archive for Cryptographic Evidence**. It is a digital evidence vault. The initial application includes a Next.js investigator dashboard and a FastAPI backend for authenticated evidence upload, independent server-side SHA-256 calculation, versioned S3-compatible object storage with retention settings, and a per-evidence hash-linked custody ledger with stored-object verification.
 
 > **Development status:** This is an early development build, not a production or legal-compliance certification. The local Compose credentials are for development only. Authentication is a single configured bearer token and actor identity; production requires an identity provider, per-user authorization, security review, database migrations, monitoring, recovery procedures, and jurisdiction-specific legal review.
 

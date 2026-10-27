@@ -22,14 +22,14 @@ export function SystemStatus({ compact = false }: { compact?: boolean }) {
 
   const label =
     status === "checking"
-      ? "Checking"
+      ? "Checking API"
       : status === "connected"
         ? compact
-          ? "API connected"
-          : "Connected"
+          ? "API available"
+          : "API available"
         : compact
-          ? "API offline"
-          : "Unavailable";
+          ? "API unavailable"
+          : "API unavailable";
 
   return (
     <span className={`system-status ${status}${compact ? " compact" : ""}`} aria-live="polite">

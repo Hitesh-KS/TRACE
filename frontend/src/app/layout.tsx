@@ -2,7 +2,7 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "TRACE — Digital Evidence Vault",
+  title: "TRACE — Tamper-proof Record Archive for Cryptographic Evidence",
   description:
     "A secure workspace for digital evidence integrity and chain-of-custody records.",
 };

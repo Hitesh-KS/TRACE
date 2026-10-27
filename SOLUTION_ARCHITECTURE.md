@@ -1,6 +1,6 @@
 # TRACE — Solution Architecture
 
-**Project:** Digital Evidence Vault (PS 18)  
+**Project:** Tamper-proof Record Archive for Cryptographic Evidence (PS 18)
 **Document status:** Proposed  
 **System name:** TRACE
 
