@@ -376,6 +376,17 @@ def test_judge_can_generate_permitted_report_types_only():
     assert denied.status_code == 403
 
 
+def test_report_type_must_be_allowlisted():
+    client, _ = make_client(actor_role="ANALYST")
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    response = client.post(
+        "/api/v1/cases/case-1/reports",
+        headers=headers,
+        json={"title": "Invalid", "report_type": "RUN_CODE"},
+    )
+    assert response.status_code == 403
+
+
 def test_report_generation_fails_without_evidence_object():
     client, _ = make_client(actor_role="ANALYST")
     with client.app.state.session_factory() as session:

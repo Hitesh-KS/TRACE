@@ -16,16 +16,16 @@ def upgrade() -> None:
             "ck_users_role",
             "role IN ('INVESTIGATOR', 'ANALYST', 'JUDGE', 'AUDITOR', 'ADMIN')",
         )
-    op.add_column(
-        "case_reports",
-        sa.Column(
-            "report_type",
-            sa.String(length=64),
-            nullable=False,
-            server_default="FORENSIC_EXAMINATION",
-        ),
-    )
-    op.alter_column("case_reports", "report_type", server_default=None)
+    with op.batch_alter_table("case_reports", schema=None) as batch_op:
+        batch_op.add_column(
+            sa.Column(
+                "report_type",
+                sa.String(length=64),
+                nullable=False,
+                server_default="FORENSIC_EXAMINATION",
+            )
+        )
+        batch_op.alter_column("report_type", server_default=None)
 
 
 def downgrade() -> None:
