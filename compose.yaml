@@ -73,6 +73,10 @@ services:
       context: ./frontend
     environment:
       TRACE_API_URL: http://api:8000
+      TRACE_API_TOKEN: ${TRACE_API_TOKEN:?set TRACE_API_TOKEN in .env}
+      TRACE_ANALYST_TOKEN: ${TRACE_ANALYST_TOKEN:?set TRACE_ANALYST_TOKEN in .env}
+      TRACE_JUDGE_TOKEN: ${TRACE_JUDGE_TOKEN:?set TRACE_JUDGE_TOKEN in .env}
+      TRACE_ADMIN_TOKEN: ${TRACE_ADMIN_TOKEN:?set TRACE_ADMIN_TOKEN in .env}
       NEXT_TELEMETRY_DISABLED: "1"
     ports:
       - "127.0.0.1:3000:3000"

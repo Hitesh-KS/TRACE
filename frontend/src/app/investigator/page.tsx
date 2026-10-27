@@ -4,6 +4,7 @@ import { ChangeEvent, FormEvent, useEffect, useMemo, useState } from "react";
 import { Icon, type IconName } from "@/components/icon";
 import { SystemStatus } from "@/components/system-status";
 import { ReportManager } from "@/components/report-manager";
+import { CaseList } from "@/components/case-list";
 
 type User = { id: string; email: string; role: string };
 type Evidence = {
@@ -21,11 +22,8 @@ type Verification = { status: string; ledger_status: string };
 type ApiResult = { items: Evidence[]; limit: number; offset: number };
 type NavItem = { label: string; href: string; icon: IconName };
 
-const API_URL = process.env.NEXT_PUBLIC_TRACE_API_URL ?? "http://localhost:8000";
-// TEMPORARY DEVELOPMENT TEST BYPASS: never enabled in production builds.
-const DEV_AUTH_BYPASS =
-  process.env.NODE_ENV !== "production" &&
-  process.env.NEXT_PUBLIC_TRACE_DEV_BYPASS_AUTH === "true";
+const API_URL = "/api/trace/investigator";
+const API_DOCS_URL = process.env.NEXT_PUBLIC_TRACE_API_URL ?? "http://localhost:8000";
 const navItems: NavItem[] = [
   { label: "Dashboard", href: "#overview", icon: "grid" },
   { label: "My cases", href: "#cases", icon: "briefcase" },
@@ -55,40 +53,29 @@ function shortenHash(value: string) {
 }
 
 export default function Home() {
-  const [token, setToken] = useState(() => (
-    typeof window === "undefined" ? "" : window.sessionStorage.getItem("trace-bearer-token") ?? ""
-  ));
-  const [tokenDraft, setTokenDraft] = useState(() => (
-    typeof window === "undefined" ? "" : window.sessionStorage.getItem("trace-bearer-token") ?? ""
-  ));
+  const [loading, setLoading] = useState(true);
   const [user, setUser] = useState<User | null>(null);
   const [evidence, setEvidence] = useState<Evidence[]>([]);
   const [error, setError] = useState("");
   const [query, setQuery] = useState("");
   const [uploadOpen, setUploadOpen] = useState(false);
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [caseId, setCaseId] = useState("");
+  const [caseId, setCaseId] = useState("case-001");
   const [clientHash, setClientHash] = useState("");
+  const [hashing, setHashing] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadMessage, setUploadMessage] = useState("");
   const [verification, setVerification] = useState<Record<string, Verification>>({});
 
   useEffect(() => {
-    if (!token || DEV_AUTH_BYPASS) return;
     const controller = new AbortController();
     Promise.all([
-      fetch(`${API_URL}/api/v1/auth/me`, {
-        headers: { Authorization: `Bearer ${token}` },
-        signal: controller.signal,
-      }),
-      fetch(`${API_URL}/api/v1/evidence?limit=100`, {
-        headers: { Authorization: `Bearer ${token}` },
-        signal: controller.signal,
-      }),
+      fetch(`${API_URL}/api/v1/auth/me`, { signal: controller.signal }),
+      fetch(`${API_URL}/api/v1/evidence?limit=100`, { signal: controller.signal }),
     ])
       .then(async ([userResponse, evidenceResponse]) => {
         if (!userResponse.ok || !evidenceResponse.ok) {
-          throw new Error("The API rejected the current bearer token.");
+          throw new Error("The API rejected the configured development session.");
         }
         const nextUser = (await userResponse.json()) as User;
         const result = (await evidenceResponse.json()) as ApiResult;
@@ -102,8 +89,11 @@ export default function Home() {
           setError(reason instanceof Error ? reason.message : "Unable to load workspace data.");
         }
       })
+      .finally(() => {
+        if (!controller.signal.aborted) setLoading(false);
+      });
     return () => controller.abort();
-  }, [token]);
+  }, []);
 
   const filteredEvidence = useMemo(
     () =>
@@ -116,36 +106,29 @@ export default function Home() {
     [evidence, query],
   );
 
-  function connect(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const nextToken = tokenDraft.trim();
-    if (!nextToken) return;
-    window.sessionStorage.setItem("trace-bearer-token", nextToken);
-    setError("");
-    setToken(nextToken);
-  }
-
-  function disconnect() {
-    window.sessionStorage.removeItem("trace-bearer-token");
-    setToken("");
-    setTokenDraft("");
-    setUser(null);
-    setEvidence([]);
-  }
-
   async function verify(item: Evidence) {
-    const response = await fetch(`${API_URL}/api/v1/evidence/${item.evidence_id}/verify`, {
-      headers: { Authorization: `Bearer ${token}` },
-    });
+    const response = await fetch(`${API_URL}/api/v1/evidence/${item.evidence_id}/verify`);
     if (!response.ok) return;
     const result = (await response.json()) as Verification;
     setVerification((current) => ({ ...current, [item.evidence_id]: result }));
   }
 
-  function onFileChange(event: ChangeEvent<HTMLInputElement>) {
+  async function onFileChange(event: ChangeEvent<HTMLInputElement>) {
     const file = event.target.files?.[0] ?? null;
     setSelectedFile(file);
     setUploadMessage("");
+    setClientHash("");
+    if (!file) return;
+    setHashing(true);
+    try {
+      const digest = await crypto.subtle.digest("SHA-256", await file.arrayBuffer());
+      const hex = Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+      setClientHash(hex);
+    } catch {
+      setUploadMessage("Unable to calculate SHA-256 in this browser. Enter the digest manually.");
+    } finally {
+      setHashing(false);
+    }
   }
 
   async function registerEvidence(event: FormEvent<HTMLFormElement>) {
@@ -160,12 +143,8 @@ export default function Home() {
     form.append("file", selectedFile);
     form.append("case_id", caseId.trim());
     form.append("client_sha256", clientHash.trim());
-    const headers: HeadersInit = token
-      ? { Authorization: `Bearer ${token}` }
-      : {};
     const response = await fetch(`${API_URL}/api/v1/evidence`, {
       method: "POST",
-      headers,
       body: form,
     });
     setUploading(false);
@@ -178,8 +157,7 @@ export default function Home() {
     setUploadOpen(false);
     setSelectedFile(null);
     setClientHash("");
-    setCaseId("");
-    setToken((current) => current);
+    setCaseId("case-001");
     window.location.reload();
   }
 
@@ -201,29 +179,27 @@ export default function Home() {
         </nav>
         <div className="trace-sidebar-footer">
           <div className="development-note"><span className="status-dot warning" /><span><strong>Development instance</strong><small>Do not store real evidence</small></span></div>
-          {user ? <button className="profile-button" onClick={disconnect}><span className="avatar">{user.email.slice(0, 1).toUpperCase()}</span><span><strong>{user.email}</strong><small>{user.role}</small></span><Icon name="arrow-right" size={14} /></button> : <span className="profile-locked"><Icon name="lock" size={14} /> Not connected</span>}
+          {user ? <div className="profile-button"><span className="avatar">{user.email.slice(0, 1).toUpperCase()}</span><span><strong>{user.email}</strong><small>{user.role}</small></span></div> : <span className="profile-locked"><Icon name="lock" size={14} /> Not connected</span>}
         </div>
       </aside>
 
       <main className="trace-main">
         <header className="trace-topbar">
           <div><span className="crumb-muted">Local workspace</span><span className="crumb-divider">/</span><strong>Investigator dashboard</strong></div>
-          <div className="topbar-actions"><SystemStatus compact /><a className="topbar-link" href={`${API_URL}/docs`} target="_blank" rel="noreferrer">API docs <Icon name="arrow-up-right" size={13} /></a></div>
+          <div className="topbar-actions"><SystemStatus compact /><a className="topbar-link" href={`${API_DOCS_URL}/docs`} target="_blank" rel="noreferrer">API docs <Icon name="arrow-up-right" size={13} /></a></div>
         </header>
 
         <div className="trace-content" id="overview">
           <section className="hero-row">
-            <div><p className="overline">INVESTIGATOR WORKSPACE / {user?.role ?? (DEV_AUTH_BYPASS ? "DEV TEST MODE" : "READ-ONLY")}</p><h1>{user ? `Investigator workspace` : "Evidence register"}</h1><p className="hero-copy">Review authorized evidence records and run integrity checks against the stored object version.</p></div>
-            <div className="hero-actions"><button className="button button-primary" onClick={() => setUploadOpen(true)} disabled={(!DEV_AUTH_BYPASS && !user) || (!DEV_AUTH_BYPASS && user?.role !== "INVESTIGATOR")}><Icon name="plus" size={16} /> Register evidence</button><a className="button button-quiet" href="#cases">View my cases <Icon name="arrow-right" size={15} /></a></div>
+            <div><p className="overline">INVESTIGATOR WORKSPACE / {user?.role ?? "READ-ONLY"}</p><h1>{user ? `Investigator workspace` : "Evidence register"}</h1><p className="hero-copy">Review authorized evidence records and run integrity checks against the stored object version.</p></div>
+            <div className="hero-actions"><button className="button button-primary" onClick={() => setUploadOpen(true)} disabled={!user || user.role !== "INVESTIGATOR"}><Icon name="plus" size={16} /> Register evidence</button><a className="button button-quiet" href="#cases">View my cases <Icon name="arrow-right" size={15} /></a></div>
           </section>
 
-          {DEV_AUTH_BYPASS && <div className="dev-bypass-notice"><Icon name="info" size={16} /><span><strong>DEVELOPMENT MODE — Frontend authentication temporarily bypassed for upload testing.</strong><small>Backend authentication and case authorization remain active. Upload requests without a valid bearer token will be rejected by the API.</small></span></div>}
-          {!token && <section className="connect-panel"><div><p className="overline">AUTHENTICATED WORKSPACE</p><h2>Connect a bearer session</h2><p>Enter the development bearer token to load only data authorized by the TRACE API. The token remains in this browser session only.</p></div><form onSubmit={connect} className="connect-form"><label htmlFor="token">Bearer token</label><div><input id="token" type="password" value={tokenDraft} onChange={(event) => setTokenDraft(event.target.value)} placeholder="Paste a development token" /><button className="button button-primary" type="submit">Connect</button></div></form></section>}
-          {error && <div className="inline-alert error"><Icon name="info" size={16} />{error}<button onClick={disconnect}>Clear session</button></div>}
+          {error && <div className="inline-alert error"><Icon name="info" size={16} />{error}<button onClick={() => window.location.reload()}>Retry</button></div>}
 
           <section className="metric-grid" aria-label="Workspace metrics">
             <MetricCard icon="briefcase" label="Assigned cases" value="Unavailable" detail="No case-list endpoint is exposed." />
-            <MetricCard icon="folder" label="Evidence records" value={token && !user && !error ? "…" : evidence.length.toString()} detail="Accessible records returned by the API." />
+            <MetricCard icon="folder" label="Evidence records" value={loading ? "…" : evidence.length.toString()} detail="Accessible records returned by the API." />
             <MetricCard icon="shield-check" label="Verified evidence" value="On demand" detail="Run an exact-version verification to establish status." />
             <MetricCard icon="activity" label="Recent activity" value="Unavailable" detail="Activity feed is not exposed by the API." />
           </section>
@@ -234,7 +210,8 @@ export default function Home() {
               <div className="table-wrap">
                 <table className="trace-table"><thead><tr><th>Evidence</th><th>Case</th><th>Recorded SHA-256</th><th>Integrity</th><th>Received</th><th /></tr></thead><tbody>
                   {filteredEvidence.map((item) => <tr key={item.evidence_id}><td><a className="record-link" href={`${API_URL}/api/v1/evidence/${item.evidence_id}`} target="_blank" rel="noreferrer">{item.file_name}</a><small>{formatBytes(item.byte_size)} · {item.evidence_id.slice(0, 8)}</small></td><td><span className="case-chip">{item.case_id}</span></td><td><code title={item.file_sha256}>{shortenHash(item.file_sha256)}</code></td><td>{verification[item.evidence_id] ? <span className={`result ${verification[item.evidence_id].status === "PASS" ? "pass" : "fail"}`}>{verification[item.evidence_id].status}</span> : <button className="table-action" onClick={() => verify(item)} disabled={!user}>Verify</button>}</td><td>{formatDate(item.created_at)}</td><td><a className="icon-action" href={`${API_URL}/api/v1/evidence/${item.evidence_id}/download`} target="_blank" rel="noreferrer" aria-label={`Open ${item.file_name} download`}><Icon name="arrow-up-right" size={14} /></a></td></tr>)}
-                  {(!token || error || filteredEvidence.length === 0) && <tr><td colSpan={6}><EmptyState title={query ? "No matching evidence" : "No evidence in this workspace"} detail={query ? "Try a different filename, case ID, or evidence ID." : "Authorized evidence will appear here after a successful registration."} /></td></tr>}
+                  {loading && <tr><td colSpan={6}><EmptyState title="Loading evidence" detail="Reading authorized records from the TRACE API." /></td></tr>}
+                  {!loading && (error || filteredEvidence.length === 0) && <tr><td colSpan={6}><EmptyState title={query ? "No matching evidence" : "No evidence in this workspace"} detail={query ? "Try a different filename, case ID, or evidence ID." : "Authorized evidence will appear here after a successful registration."} /></td></tr>}
                 </tbody></table>
               </div>
               <div className="panel-caption"><span>{evidence.length} records</span><span>Original files remain in object storage; this table contains metadata only.</span></div>
@@ -243,7 +220,7 @@ export default function Home() {
           </section>
 
           <section className="lower-grid">
-            <div className="panel" id="cases"><div className="panel-heading"><div><p className="overline">ACCESS SCOPE</p><h2>My cases</h2><p>Case enumeration is intentionally not exposed by the current API.</p></div><Icon name="briefcase" size={20} /></div><EmptyState title="Case list unavailable" detail="Use an authorized case ID with the evidence registration or report APIs. The backend does not currently expose a case-list endpoint." /></div>
+            <CaseList role="investigator" />
             <div className="panel" id="system"><div className="panel-heading"><div><p className="overline">SERVICE OBSERVABILITY</p><h2>System status</h2><p>The health proxy checks API availability only.</p></div><SystemStatus /></div><div className="system-row"><span className="status-dot connected" /><span><strong>TRACE API</strong><small>Health endpoint response</small></span><SystemStatus compact /></div><div className="system-footnote">Database and object-storage health are not separately exposed by <code>/healthz</code>.</div></div>
           </section>
           <section className="panel quiet-section" id="notes"><div className="panel-heading"><div><p className="overline">ANALYSIS</p><h2>Forensic notes</h2><p>Analyst-only note endpoints are available through the API. This investigator workspace does not bypass that permission.</p></div><Icon name="document" size={20} /></div></section>
@@ -253,7 +230,7 @@ export default function Home() {
         </div>
       </main>
 
-      {uploadOpen && <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="upload-title"><div className="modal-heading"><div><p className="overline">EVIDENCE REGISTRATION</p><h2 id="upload-title">Register original evidence</h2></div><button className="icon-action" onClick={() => setUploadOpen(false)} aria-label="Close dialog">×</button></div><p className="modal-copy">The server recalculates SHA-256 and records the exact object version. Client-provided hashes are used only for request validation.</p><form onSubmit={registerEvidence}><label htmlFor="case-id">Authorized case ID</label><input id="case-id" value={caseId} onChange={(event) => setCaseId(event.target.value)} placeholder="e.g. CASE-2026-001" /><label htmlFor="evidence-file">Evidence file</label><input id="evidence-file" type="file" onChange={onFileChange} /><label htmlFor="client-hash">Client SHA-256</label><input id="client-hash" value={clientHash} onChange={(event) => setClientHash(event.target.value)} placeholder="64-character hexadecimal digest" /><p className="form-hint">{selectedFile ? `${selectedFile.name} · ${formatBytes(selectedFile.size)}` : "No file selected."}</p>{uploadMessage && <div className="inline-alert">{uploadMessage}</div>}<div className="modal-actions"><button type="button" className="button button-quiet" onClick={() => setUploadOpen(false)}>Cancel</button><button type="submit" className="button button-primary" disabled={uploading}>{uploading ? "Registering…" : "Register evidence"}</button></div></form></section></div>}
+      {uploadOpen && <div className="modal-backdrop" role="presentation"><section className="modal" role="dialog" aria-modal="true" aria-labelledby="upload-title"><div className="modal-heading"><div><p className="overline">EVIDENCE REGISTRATION</p><h2 id="upload-title">Register original evidence</h2></div><button className="icon-action" onClick={() => setUploadOpen(false)} aria-label="Close dialog">×</button></div><p className="modal-copy">The server recalculates SHA-256 and records the exact object version. Client-provided hashes are used only for request validation.</p><form onSubmit={registerEvidence}><label htmlFor="case-id">Authorized case ID</label><input id="case-id" value={caseId} onChange={(event) => setCaseId(event.target.value)} placeholder="case-001" /><p className="form-hint">Seeded local case: <code>case-001</code>. Use a case you are a member of.</p><label htmlFor="evidence-file">Evidence file</label><input id="evidence-file" type="file" onChange={onFileChange} /><label htmlFor="client-hash">Client SHA-256</label><input id="client-hash" value={clientHash} onChange={(event) => setClientHash(event.target.value)} placeholder="Calculated automatically after selecting a file" /><p className="form-hint">{hashing ? "Calculating SHA-256…" : selectedFile ? `${selectedFile.name} · ${formatBytes(selectedFile.size)}` : "No file selected."}</p>{uploadMessage && <div className="inline-alert">{uploadMessage}</div>}<div className="modal-actions"><button type="button" className="button button-quiet" onClick={() => setUploadOpen(false)}>Cancel</button><button type="submit" className="button button-primary" disabled={uploading || hashing || !clientHash}>{uploading ? "Registering…" : "Register evidence"}</button></div></form></section></div>}
     </div>
   );
 }

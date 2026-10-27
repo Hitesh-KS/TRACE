@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import json
 import logging
 import re
 import secrets
@@ -19,6 +20,8 @@ from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFi
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
+from reportlab.graphics.barcode.qr import QrCodeWidget
+from reportlab.graphics.shapes import Drawing
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
@@ -30,7 +33,7 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -64,10 +67,10 @@ REPORT_TYPES = {
     "JUDICIAL_REVIEW",
 }
 REPORT_TYPES_BY_ROLE = {
-    "INVESTIGATOR": {"EVIDENCE_REGISTRATION", "CHAIN_OF_CUSTODY", "INTEGRITY_VERIFICATION"},
-    "ANALYST": {"FORENSIC_EXAMINATION", "CHAIN_OF_CUSTODY", "INTEGRITY_VERIFICATION"},
-    "JUDGE": {"JUDICIAL_REVIEW", "CHAIN_OF_CUSTODY", "INTEGRITY_VERIFICATION"},
-    "AUDITOR": REPORT_TYPES,
+    "INVESTIGATOR": {"CHAIN_OF_CUSTODY"},
+    "ANALYST": {"FORENSIC_EXAMINATION"},
+    "JUDGE": {"JUDICIAL_REVIEW"},
+    "AUDITOR": {"JUDICIAL_REVIEW"},
 }
 
 
@@ -404,6 +407,190 @@ def create_app(
                 body,
             )
         )
+        if report_type == "JUDICIAL_REVIEW":
+            manifest_sha256 = hashlib.sha256(
+                "|".join(
+                    f"{item.id}:{item.file_sha256}" for item in evidence
+                ).encode("utf-8")
+            ).hexdigest()
+            qr_payload = json.dumps(
+                {
+                    "report_id": str(report_id),
+                    "case_id": case.case_id,
+                    "report_type": report_type,
+                    "evidence_manifest_sha256": manifest_sha256,
+                },
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            qr = QrCodeWidget(qr_payload)
+            bounds = qr.getBounds()
+            qr_size = 1.35 * inch
+            drawing = Drawing(
+                qr_size,
+                qr_size,
+                transform=[
+                    qr_size / (bounds[2] - bounds[0]),
+                    0,
+                    0,
+                    qr_size / (bounds[3] - bounds[1]),
+                    0,
+                    0,
+                ],
+            )
+            drawing.add(qr)
+            escaped_payload = (
+                qr_payload.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+            )
+            story.extend(
+                [
+                    Paragraph("Verification QR", styles["Heading2"]),
+                    drawing,
+                    Paragraph(f"QR payload: {escaped_payload}", body),
+                    Paragraph(
+                        "The QR code identifies this report, its case, and a SHA-256 manifest of the evidence hashes included above. It is a technical verification aid, not a legal certification or guarantee of admissibility.",
+                        body,
+                    ),
+                ]
+            )
+        SimpleDocTemplate(
+            buffer,
+            pagesize=letter,
+            pageCompression=0,
+            rightMargin=0.45 * inch,
+            leftMargin=0.45 * inch,
+            topMargin=0.5 * inch,
+            bottomMargin=0.5 * inch,
+        ).build(story)
+        return buffer.getvalue()
+
+    def system_integrity_summary(session: Session) -> dict:
+        evidence_items = list(
+            session.scalars(
+                select(Evidence).order_by(Evidence.created_at, Evidence.id)
+            )
+        )
+        passed = failed = ledger_failed = storage_errors = 0
+        for item in evidence_items:
+            blocks = list(
+                session.scalars(
+                    select(EvidenceLedger)
+                    .where(EvidenceLedger.evidence_id == item.id)
+                    .order_by(EvidenceLedger.sequence)
+                )
+            )
+            ledger_ok = verify_chain(blocks, item.id)
+            if not ledger_ok:
+                ledger_failed += 1
+            try:
+                body = app.state.storage.get(
+                    key=item.object_key, version_id=item.object_version_id
+                )
+                try:
+                    digest = hashlib.sha256()
+                    while chunk := body.read(CHUNK_SIZE):
+                        digest.update(chunk)
+                finally:
+                    body.close()
+            except (BotoCoreError, StorageUnavailable, RuntimeError):
+                storage_errors += 1
+                failed += 1
+                continue
+            if ledger_ok and hmac.compare_digest(
+                digest.hexdigest(), item.file_sha256
+            ):
+                passed += 1
+            else:
+                failed += 1
+        return {
+            "checked": len(evidence_items),
+            "passed": passed,
+            "failed": failed,
+            "ledger_failed": ledger_failed,
+            "storage_errors": storage_errors,
+            "checked_at": datetime.now(timezone.utc),
+        }
+
+    def build_system_log_pdf(
+        *, creator: User, counts: dict[str, int], integrity: dict
+    ) -> bytes:
+        buffer = BytesIO()
+        styles = getSampleStyleSheet()
+        body = styles["BodyText"]
+        body.leading = 11
+        generated_at = datetime.now(timezone.utc).isoformat()
+        story = [
+            Paragraph("TRACE System Log", styles["Title"]),
+            Paragraph(
+                "Infrastructure health and routing export. No evidence filenames, hashes, or contents are included.",
+                body,
+            ),
+            Paragraph(f"Generated by: {creator.email} ({creator.id})", body),
+            Paragraph(f"Generated at: {generated_at}", body),
+            Spacer(1, 0.18 * inch),
+            Paragraph("Resource counts", styles["Heading2"]),
+        ]
+        count_rows = [["Resource", "Count"]]
+        for label, value in counts.items():
+            count_rows.append([label, str(value)])
+        count_table = Table(count_rows, repeatRows=1, colWidths=[3.5 * inch, 1.5 * inch])
+        count_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9e2f3")),
+                    ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+        story.extend([count_table, Spacer(1, 0.12 * inch)])
+        story.append(Paragraph("System integrity summary", styles["Heading2"]))
+        integrity_rows = [["Metric", "Value"]]
+        for label, value in integrity.items():
+            integrity_rows.append([label, str(value)])
+        integrity_table = Table(integrity_rows, repeatRows=1, colWidths=[3.5 * inch, 1.5 * inch])
+        integrity_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9e2f3")),
+                    ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ]
+            )
+        )
+        story.extend([integrity_table, Spacer(1, 0.12 * inch)])
+        story.append(Paragraph("Routing", styles["Heading2"]))
+        route_rows = [["Route", "Purpose"]]
+        for route, purpose in (
+            ("GET /healthz", "API liveness"),
+            ("GET /api/v1/auth/me", "Session identity"),
+            ("GET /api/v1/evidence", "Authorized evidence listing"),
+            ("GET /api/v1/evidence/{evidence_id}/verify", "Evidence integrity verification"),
+            ("GET /api/v1/cases/{case_id}/reports", "Case report listing"),
+            ("GET /api/v1/admin/system-integrity", "Aggregate system integrity check"),
+            ("GET /api/v1/admin/system-log", "This system log export"),
+        ):
+            route_rows.append([route, purpose])
+        route_table = Table(route_rows, repeatRows=1, colWidths=[3.5 * inch, 1.5 * inch])
+        route_table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9e2f3")),
+                    ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
+                    ("FONTSIZE", (0, 0), (-1, -1), 7),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ]
+            )
+        )
+        story.extend([route_table, Spacer(1, 0.12 * inch)])
+        story.append(
+            Paragraph(
+                "This export is an operational system log. It is not a legal custody report and contains no evidence records.",
+                body,
+            )
+        )
         SimpleDocTemplate(
             buffer,
             pagesize=letter,
@@ -521,10 +708,35 @@ def create_app(
     def healthz():
         return {"status": "ok"}
 
+    @app.get("/api/v1/cases")
+    def list_cases(
+        user: Annotated[
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))
+        ],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        cases = session.scalars(
+            select(Case)
+            .join(CaseMembership, CaseMembership.case_id == Case.case_id)
+            .where(CaseMembership.user_id == user.id)
+            .order_by(Case.created_at.desc(), Case.case_id)
+        )
+        return {
+            "items": [
+                {
+                    "case_id": case.case_id,
+                    "name": case.name,
+                    "description": case.description,
+                    "created_at": case.created_at,
+                }
+                for case in cases
+            ]
+        }
+
     @app.get("/api/v1/evidence")
     def list_evidence(
         user: Annotated[
-            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "AUDITOR"))
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))
         ],
         session: Annotated[Session, Depends(get_db)],
         limit: Annotated[int, Query(ge=1, le=100)] = 50,
@@ -553,7 +765,7 @@ def create_app(
     def get_evidence(
         evidence_id: uuid.UUID,
         user: Annotated[
-            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "AUDITOR"))
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))
         ],
         session: Annotated[Session, Depends(get_db)],
     ):
@@ -809,7 +1021,12 @@ def create_app(
     @app.get("/api/v1/evidence/{evidence_id}/download")
     def download_evidence(
         evidence_id: uuid.UUID,
-        user: Annotated[User, Depends(require_roles("ANALYST"))],
+        user: Annotated[
+            User,
+            Depends(
+                require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR")
+            ),
+        ],
         session: Annotated[Session, Depends(get_db)],
     ):
         evidence = get_authorized_evidence(evidence_id, user, session)
@@ -893,6 +1110,42 @@ def create_app(
             "created_at": case.created_at,
         }
 
+    @app.get("/api/v1/admin/cases")
+    def list_admin_cases(
+        _: Annotated[User, Depends(require_roles("ADMIN"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        cases = session.scalars(select(Case).order_by(Case.created_at.desc(), Case.case_id))
+        return {
+            "items": [
+                {
+                    "case_id": case.case_id,
+                    "name": case.name,
+                    "description": case.description,
+                    "created_at": case.created_at,
+                }
+                for case in cases
+            ]
+        }
+
+    @app.get("/api/v1/admin/users")
+    def list_admin_users(
+        _: Annotated[User, Depends(require_roles("ADMIN"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        users = session.scalars(select(User).order_by(User.email))
+        return {
+            "items": [
+                {
+                    "id": str(user.id),
+                    "email": user.email,
+                    "role": user.role,
+                    "is_active": user.is_active,
+                }
+                for user in users
+            ]
+        }
+
     @app.post("/api/v1/admin/case-memberships", status_code=201)
     def create_case_membership(
         request: CaseMembershipRequest,
@@ -925,12 +1178,58 @@ def create_app(
             "created_at": membership.created_at,
         }
 
+    @app.get("/api/v1/admin/system-integrity")
+    def get_system_integrity(
+        _: Annotated[User, Depends(require_roles("ADMIN"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        return system_integrity_summary(session)
+
+    @app.get("/api/v1/admin/system-log")
+    def download_system_log(
+        admin: Annotated[User, Depends(require_roles("ADMIN"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        counts = {
+            "Users": session.scalar(select(func.count()).select_from(User)) or 0,
+            "Cases": session.scalar(select(func.count()).select_from(Case)) or 0,
+            "Evidence records": session.scalar(
+                select(func.count()).select_from(Evidence)
+            )
+            or 0,
+            "Case reports": session.scalar(
+                select(func.count()).select_from(CaseReport)
+            )
+            or 0,
+            "Forensic notes": session.scalar(
+                select(func.count()).select_from(ForensicNote)
+            )
+            or 0,
+        }
+        integrity = system_integrity_summary(session)
+        pdf = build_system_log_pdf(
+            creator=admin, counts=counts, integrity=integrity
+        )
+        return StreamingResponse(
+            BytesIO(pdf),
+            media_type="application/pdf",
+            headers={
+                "Content-Disposition": 'attachment; filename="trace-system-log.pdf"',
+                "Content-Length": str(len(pdf)),
+                "X-Report-SHA256": hashlib.sha256(pdf).hexdigest(),
+                "X-Content-Type-Options": "nosniff",
+                "Cache-Control": "no-store",
+            },
+        )
+
     @app.post("/api/v1/evidence", status_code=201)
     def upload_evidence(
         file: Annotated[UploadFile, File()],
         case_id: Annotated[str, Form(min_length=1, max_length=200)],
         client_sha256: Annotated[str, Form()],
-        user: Annotated[User, Depends(require_roles("INVESTIGATOR"))],
+        user: Annotated[
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST"))
+        ],
         session: Annotated[Session, Depends(get_db)],
     ):
         if not user_has_case_access(
@@ -1038,7 +1337,7 @@ def create_app(
     def verify_evidence(
         evidence_id: uuid.UUID,
         user: Annotated[
-            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "AUDITOR"))
+            User, Depends(require_roles("INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"))
         ],
         session: Annotated[Session, Depends(get_db)],
     ):

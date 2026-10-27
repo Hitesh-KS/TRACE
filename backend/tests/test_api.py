@@ -591,11 +591,50 @@ def test_non_admin_cannot_provision_membership():
     assert response.status_code == 403
 
 
+def test_case_list_is_scoped_to_user_memberships():
+    client, _ = make_client(actor_role="ANALYST")
+    with client.app.state.session_factory() as session:
+        session.add(Case(case_id="unassigned", created_at=datetime.now(timezone.utc)))
+        session.commit()
+
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    response = client.get("/api/v1/cases", headers=headers)
+    assert response.status_code == 200
+    assert [item["case_id"] for item in response.json()["items"]] == ["case-1"]
+    assert client.get("/api/v1/cases").status_code == 401
+
+
+def test_admin_can_list_cases_and_users_but_other_roles_cannot():
+    admin, _ = make_client(actor_role="ADMIN")
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+
+    cases = admin.get("/api/v1/admin/cases", headers=headers)
+    users = admin.get("/api/v1/admin/users", headers=headers)
+
+    assert cases.status_code == 200
+    assert [item["case_id"] for item in cases.json()["items"]] == ["case-1"]
+    assert users.status_code == 200
+    assert users.json()["items"] == [
+        {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "email": "configured-actor@local",
+            "role": "ADMIN",
+            "is_active": True,
+        }
+    ]
+
+    investigator, _ = make_client()
+    investigator_headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    assert investigator.get("/api/v1/admin/cases", headers=investigator_headers).status_code == 403
+    assert investigator.get("/api/v1/admin/users", headers=investigator_headers).status_code == 403
+
+
 @pytest.mark.parametrize(
     ("role", "verify_status", "upload_status"),
     [
         ("INVESTIGATOR", 404, 201),
-        ("ANALYST", 404, 403),
+        ("ANALYST", 404, 201),
+        ("JUDGE", 404, 403),
         ("AUDITOR", 404, 403),
         ("ADMIN", 403, 403),
     ],
@@ -619,6 +658,25 @@ def test_role_permissions_are_enforced(role, verify_status, upload_status):
         },
     )
     assert upload.status_code == upload_status
+
+
+def test_judge_can_list_authorized_evidence_but_not_upload():
+    client, _ = make_client(actor_role="JUDGE")
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    response = client.get("/api/v1/evidence", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["items"] == []
+
+    upload = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("sample.bin", b"original evidence", "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(b"original evidence").hexdigest(),
+        },
+    )
+    assert upload.status_code == 403
 
 
 def test_evidence_listing_and_details_are_case_scoped():
@@ -675,7 +733,40 @@ def test_analyst_downloads_exact_version_and_creates_audit():
         assert audit.object_version_id == response.json()["object_version_id"]
 
 
-def test_admin_and_investigator_cannot_download_and_storage_is_not_read():
+@pytest.mark.parametrize(
+    "role", ["INVESTIGATOR", "ANALYST", "JUDGE", "AUDITOR"]
+)
+def test_read_roles_can_download_evidence(role):
+    client, storage = make_client()
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    payload = b"original evidence"
+    response = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("sample.bin", payload, "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    assert response.status_code == 201
+    evidence_id = response.json()["evidence_id"]
+    with client.app.state.session_factory() as session:
+        user = session.get(User, uuid.UUID("00000000-0000-4000-8000-000000000002"))
+        user.role = role
+        session.commit()
+
+    download = client.get(
+        f"/api/v1/evidence/{evidence_id}/download", headers=headers
+    )
+    assert download.status_code == 200
+    assert download.content == payload
+    assert storage.get_calls
+    with client.app.state.session_factory() as session:
+        assert session.query(DownloadAudit).count() == 1
+
+
+def test_admin_cannot_download_evidence_or_read_storage():
     client, storage = make_client()
     headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
     payload = b"original evidence"
@@ -689,11 +780,58 @@ def test_admin_and_investigator_cannot_download_and_storage_is_not_read():
         },
     )
     evidence_id = response.json()["evidence_id"]
+    with client.app.state.session_factory() as session:
+        user = session.get(User, uuid.UUID("00000000-0000-4000-8000-000000000002"))
+        user.role = "ADMIN"
+        session.commit()
+
     denied = client.get(f"/api/v1/evidence/{evidence_id}/download", headers=headers)
     assert denied.status_code == 403
     assert storage.get_calls == []
     with client.app.state.session_factory() as session:
         assert session.query(DownloadAudit).count() == 0
+
+
+def test_admin_can_run_system_integrity_and_export_system_log():
+    client, storage = make_client()
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    payload = b"system integrity evidence"
+    response = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("sample.bin", payload, "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    assert response.status_code == 201
+    with client.app.state.session_factory() as session:
+        user = session.get(User, uuid.UUID("00000000-0000-4000-8000-000000000002"))
+        user.role = "ADMIN"
+        session.commit()
+
+    integrity = client.get("/api/v1/admin/system-integrity", headers=headers)
+    assert integrity.status_code == 200
+    assert integrity.json()["checked"] == 1
+    assert integrity.json()["passed"] == 1
+    assert integrity.json()["failed"] == 0
+    assert integrity.json()["ledger_failed"] == 0
+    assert integrity.json()["storage_errors"] == 0
+
+    system_log = client.get("/api/v1/admin/system-log", headers=headers)
+    assert system_log.status_code == 200
+    assert system_log.headers["content-type"] == "application/pdf"
+    assert system_log.content.startswith(b"%PDF-")
+    assert system_log.headers["x-report-sha256"]
+    assert b"sample.bin" not in system_log.content
+
+    investigator, _ = make_client()
+    denied = investigator.get(
+        "/api/v1/admin/system-log",
+        headers={"Authorization": "Bearer test-token-" + ("x" * 32)},
+    )
+    assert denied.status_code == 403
 
 
 def test_missing_object_version_fails_without_download_audit():

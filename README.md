@@ -2,7 +2,7 @@
 
 TRACE stands for **Tamper-proof Record Archive for Cryptographic Evidence**. It is a digital evidence vault. The initial application includes a Next.js investigator dashboard and a FastAPI backend for authenticated evidence upload, independent server-side SHA-256 calculation, versioned S3-compatible object storage with retention settings, and a per-evidence hash-linked custody ledger with stored-object verification.
 
-> **Development status:** This is an early development build, not a production or legal-compliance certification. The local Compose credentials are for development only. Authentication is a single configured bearer token and actor identity; production requires an identity provider, per-user authorization, security review, database migrations, monitoring, recovery procedures, and jurisdiction-specific legal review.
+> **Development status:** This is an early development build, not a production or legal-compliance certification. The local Compose credentials are for development only. Authentication uses configured development bearer tokens and actor identities; production requires an identity provider, per-user authorization, security review, database migrations, monitoring, recovery procedures, and jurisdiction-specific legal review.
 
 The current slice does not yet include metadata extraction, externally anchored ledger checkpoints, or ingest idempotency/reconciliation. Evidence access is scoped to explicit database-backed case memberships; unassigned users fail closed.
 
@@ -14,10 +14,18 @@ Requirements: Docker Engine and Docker Compose.
 cp .env.example .env
 ```
 
-Replace `TRACE_API_TOKEN` in `.env` with a secret of at least 32 characters, then start the services:
+Replace `TRACE_API_TOKEN`, `TRACE_ANALYST_TOKEN`, `TRACE_JUDGE_TOKEN`, and
+`TRACE_ADMIN_TOKEN` in `.env` with independent secrets of at least 32 characters,
+then start the services:
 
 ```bash
 docker compose up --build
+```
+
+After the API is healthy, seed the local role accounts and case membership:
+
+```bash
+docker compose exec -e PYTHONPATH=/app api python scripts/seed_dev_roles.py
 ```
 
 Open the dashboard at `http://localhost:3000`. The API is available at `http://localhost:8000`; interactive API documentation is at `http://localhost:8000/docs`. The dashboard displays live API health and empty states until evidence is added.
@@ -43,6 +51,19 @@ evidence endpoints. `POST /api/v1/auth/logout` revokes the current session.
 The configured `TRACE_API_TOKEN` remains available for local development and
 maps to `TRACE_ACTOR_ID`; it is not production authentication. The configured
 actor must also have a row in `case_memberships` to access evidence.
+
+The bundled frontend does not ask for a bearer token. It proxies API requests
+through `/api/trace/<role>/*` and injects the matching development token on the
+frontend server, so tokens are not exposed to browser JavaScript. The role
+prefixes are `investigator`, `analyst`, `judge`, and `admin`; `/api/trace/*`
+without a role prefix uses `TRACE_API_TOKEN`. This is a local-development
+convenience, not production authentication.
+
+`seed_dev_roles.py` creates deterministic local accounts for the four role
+workspaces, adds them to `case-001`, and installs long-lived development
+sessions for the role tokens. The accounts use the password
+`trace-dev-password` unless `TRACE_DEV_PASSWORD` is set. Re-run the script after
+resetting the database or changing a role token.
 
 ### Case authorization
 
@@ -86,12 +107,20 @@ do not modify evidence hashes or append custody-ledger events.
 
 Migration `0006_case_reports` adds report metadata storage. Migration
 `0007_report_types_and_judge` adds an explicit report type and the `JUDGE`
-role constraint. With case membership, investigators can generate evidence
-registration, custody, and integrity reports; analysts can generate forensic
-examination, custody, and integrity reports; and judges can generate judicial
-review, custody, and integrity reports. Auditors retain access to all report
-types. Report listing, retrieval, and download are filtered by the same
-server-side role allowlist.
+role constraint. With case membership, report generation is role-scoped:
+investigators generate `CHAIN_OF_CUSTODY` (standard custody report), analysts
+generate `FORENSIC_EXAMINATION` (detailed technical log), and judges/auditors
+generate `JUDICIAL_REVIEW` (legal custody export). The legal custody export
+includes a verification QR containing the report ID, case ID, and an evidence
+manifest SHA-256. It is a technical verification artifact, not a legal
+certification or guarantee of admissibility. Report listing, retrieval, and
+download are filtered by the same server-side role allowlist.
+
+Administrators can generate a separate system log through
+`GET /api/v1/admin/system-log`. It contains aggregate resource counts, an
+integrity summary, and routing information, but no evidence filenames, hashes,
+or contents. `GET /api/v1/admin/system-integrity` runs the aggregate
+storage/ledger check used by the system log.
 
 ```text
 POST /api/v1/cases/{case_id}/reports
@@ -119,11 +148,13 @@ The local stack uses MinIO with Object Lock enabled to exercise the S3 API. It r
 | `GET /api/v1/auth/me` | Authenticated current session | No ledger event |
 | `POST /api/v1/admin/cases` | Authenticated `ADMIN` | Creates case metadata only |
 | `POST /api/v1/admin/case-memberships` | Authenticated `ADMIN`; target user and case must exist | Creates membership only |
-| `POST /api/v1/evidence` | Authenticated `INVESTIGATOR` with membership in the submitted case | Stores the object, then appends `INGEST` |
-| `GET /api/v1/evidence` | Authenticated `INVESTIGATOR`, `ANALYST`, or `AUDITOR` with case membership | Returns authorized metadata only |
-| `GET /api/v1/evidence/{evidence_id}` | Authenticated `INVESTIGATOR`, `ANALYST`, or `AUDITOR` with case membership | Returns authorized metadata and custody summaries |
-| `GET /api/v1/evidence/{evidence_id}/download` | Authenticated `ANALYST` with case membership; `ADMIN` is denied | Reads the exact object version and records `INITIATED` download audit |
-| `GET /api/v1/evidence/{evidence_id}/verify` | Authenticated `INVESTIGATOR`, `ANALYST`, or `AUDITOR` with membership; `ADMIN` is denied | Reads the exact object version, validates the chain, then appends `VERIFY` |
+| `POST /api/v1/evidence` | Authenticated `INVESTIGATOR` or `ANALYST` with membership in the submitted case | Stores the object, then appends `INGEST` |
+| `GET /api/v1/evidence` | Authenticated `INVESTIGATOR`, `ANALYST`, `JUDGE`, or `AUDITOR` with case membership | Returns authorized metadata only |
+| `GET /api/v1/evidence/{evidence_id}` | Authenticated `INVESTIGATOR`, `ANALYST`, `JUDGE`, or `AUDITOR` with case membership | Returns authorized metadata and custody summaries |
+| `GET /api/v1/evidence/{evidence_id}/download` | Authenticated `INVESTIGATOR`, `ANALYST`, `JUDGE`, or `AUDITOR` with case membership; `ADMIN` is denied | Reads the exact object version and records `INITIATED` download audit |
+| `GET /api/v1/evidence/{evidence_id}/verify` | Authenticated `INVESTIGATOR`, `ANALYST`, `JUDGE`, or `AUDITOR` with membership; `ADMIN` is denied | Reads the exact object version, validates the chain, then appends `VERIFY` |
+| `GET /api/v1/admin/system-integrity` | Authenticated `ADMIN` | Reads stored objects and ledger chains; returns aggregate counts only |
+| `GET /api/v1/admin/system-log` | Authenticated `ADMIN` | Streams an infrastructure/routing PDF with no evidence records |
 
 Evidence lookups join against `case_memberships` before object storage reads.
 Out-of-scope evidence returns `404` to avoid disclosing its existence.
