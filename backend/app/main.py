@@ -33,6 +33,7 @@ from app.models import (
     DownloadAudit,
     Evidence,
     EvidenceLedger,
+    ForensicNote,
     User,
 )
 from app.storage import ObjectStorage, StorageUnavailable
@@ -63,6 +64,11 @@ class CaseRequest(BaseModel):
 class CaseMembershipRequest(BaseModel):
     user_id: uuid.UUID
     case_id: str = Field(min_length=1, max_length=200)
+
+
+class ForensicNoteRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=255)
+    content: str = Field(min_length=1, max_length=50000)
 
 
 class Storage(Protocol):
@@ -246,6 +252,17 @@ def create_app(
             "created_at": evidence.created_at,
         }
 
+    def forensic_note_response(note: ForensicNote) -> dict:
+        return {
+            "id": str(note.id),
+            "evidence_id": str(note.evidence_id),
+            "case_id": note.case_id,
+            "analyst_id": str(note.analyst_id),
+            "title": note.title,
+            "content": note.content,
+            "created_at": note.created_at,
+        }
+
     def auth_response(token: str, user: User, expires_at: datetime):
         return {
             "access_token": token,
@@ -389,6 +406,68 @@ def create_app(
             for sequence, action_type, timestamp in events
         ]
         return response
+
+    @app.post("/api/v1/evidence/{evidence_id}/notes", status_code=201)
+    def create_forensic_note(
+        evidence_id: uuid.UUID,
+        request: ForensicNoteRequest,
+        analyst: Annotated[User, Depends(require_roles("ANALYST"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        evidence = get_authorized_evidence(evidence_id, analyst, session)
+        title = request.title.strip()
+        if not title:
+            raise HTTPException(status_code=422, detail="title must not be blank")
+        note = ForensicNote(
+            evidence_id=evidence.id,
+            case_id=evidence.case_id,
+            analyst_id=analyst.id,
+            title=title,
+            content=request.content,
+            created_at=datetime.now(timezone.utc),
+        )
+        try:
+            session.add(note)
+            session.commit()
+        except SQLAlchemyError as exc:
+            session.rollback()
+            logger.exception("Forensic note creation failed for %s", evidence_id)
+            raise HTTPException(
+                status_code=503, detail="Forensic note could not be saved"
+            ) from exc
+        return forensic_note_response(note)
+
+    @app.get("/api/v1/evidence/{evidence_id}/notes")
+    def list_forensic_notes(
+        evidence_id: uuid.UUID,
+        analyst: Annotated[User, Depends(require_roles("ANALYST"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        evidence = get_authorized_evidence(evidence_id, analyst, session)
+        notes = session.scalars(
+            select(ForensicNote)
+            .where(ForensicNote.evidence_id == evidence.id)
+            .order_by(ForensicNote.created_at, ForensicNote.id)
+        )
+        return {"items": [forensic_note_response(note) for note in notes]}
+
+    @app.get("/api/v1/evidence/{evidence_id}/notes/{note_id}")
+    def get_forensic_note(
+        evidence_id: uuid.UUID,
+        note_id: uuid.UUID,
+        analyst: Annotated[User, Depends(require_roles("ANALYST"))],
+        session: Annotated[Session, Depends(get_db)],
+    ):
+        evidence = get_authorized_evidence(evidence_id, analyst, session)
+        note = session.scalar(
+            select(ForensicNote).where(
+                ForensicNote.id == note_id,
+                ForensicNote.evidence_id == evidence.id,
+            )
+        )
+        if note is None:
+            raise HTTPException(status_code=404, detail="Forensic note not found")
+        return forensic_note_response(note)
 
     @app.get("/api/v1/evidence/{evidence_id}/download")
     def download_evidence(

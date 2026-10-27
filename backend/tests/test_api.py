@@ -19,6 +19,7 @@ from app.models import (
     CaseMembership,
     DownloadAudit,
     Evidence,
+    ForensicNote,
     User,
 )
 from app.storage import StorageUnavailable
@@ -140,6 +141,119 @@ def test_upload_and_verify_stored_evidence():
     )
     assert verification.status_code == 200
     assert verification.json()["status"] == "FAIL"
+
+
+def test_analyst_can_create_list_and_retrieve_forensic_note():
+    client, _ = make_client(actor_role="ANALYST")
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    with client.app.state.session_factory() as session:
+        evidence = Evidence(
+            id=uuid.uuid4(),
+            uploader_id=uuid.UUID("00000000-0000-4000-8000-000000000002"),
+            case_id="case-1",
+            file_name="sample.bin",
+            content_type="application/octet-stream",
+            file_sha256=hashlib.sha256(b"evidence").hexdigest(),
+            object_key="evidence/test/original",
+            object_version_id="version-1",
+            status="READY",
+            byte_size=8,
+            created_at=datetime.now(timezone.utc),
+        )
+        session.add(evidence)
+        session.commit()
+        evidence_id = evidence.id
+
+    response = client.post(
+        f"/api/v1/evidence/{evidence_id}/notes",
+        headers=headers,
+        json={"title": "Hash observation", "content": "Observed matching digest."},
+    )
+    assert response.status_code == 201
+    note = response.json()
+    assert note["case_id"] == "case-1"
+    assert note["analyst_id"] == "00000000-0000-4000-8000-000000000002"
+
+    listed = client.get(
+        f"/api/v1/evidence/{evidence_id}/notes",
+        headers=headers,
+    )
+    assert listed.status_code == 200
+    assert listed.json()["items"][0]["id"] == note["id"]
+
+    retrieved = client.get(
+        f"/api/v1/evidence/{evidence_id}/notes/{note['id']}",
+        headers=headers,
+    )
+    assert retrieved.status_code == 200
+    assert retrieved.json()["content"] == "Observed matching digest."
+
+    with client.app.state.session_factory() as session:
+        stored_note = session.get(ForensicNote, uuid.UUID(note["id"]))
+        stored_evidence = session.get(Evidence, evidence_id)
+        assert stored_note.analyst_id == uuid.UUID(
+            "00000000-0000-4000-8000-000000000002"
+        )
+        assert stored_evidence.file_sha256 == hashlib.sha256(b"evidence").hexdigest()
+
+
+def test_non_analyst_and_unrelated_case_cannot_create_forensic_note():
+    investigator, _ = make_client(actor_role="INVESTIGATOR")
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    evidence_id = uuid.uuid4()
+    with investigator.app.state.session_factory() as session:
+        session.add(
+            Evidence(
+                id=evidence_id,
+                case_id="case-1",
+                file_name="sample.bin",
+                content_type="application/octet-stream",
+                file_sha256="a" * 64,
+                object_key="evidence/test/original",
+                object_version_id="version-1",
+                status="READY",
+                byte_size=1,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+    assert (
+        investigator.post(
+            f"/api/v1/evidence/{evidence_id}/notes",
+            headers=headers,
+            json={"title": "Not allowed", "content": "No analyst role."},
+        ).status_code
+        == 403
+    )
+
+    analyst, _ = make_client(actor_role="ANALYST")
+    with analyst.app.state.session_factory() as session:
+        session.add(
+            Case(case_id="case-2", created_at=datetime.now(timezone.utc))
+        )
+        session.add(
+            Evidence(
+                id=evidence_id,
+                case_id="case-2",
+                file_name="other.bin",
+                content_type="application/octet-stream",
+                file_sha256="b" * 64,
+                object_key="evidence/other/original",
+                object_version_id="version-2",
+                status="READY",
+                byte_size=1,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+    assert (
+        analyst.post(
+            f"/api/v1/evidence/{evidence_id}/notes",
+            headers=headers,
+            json={"title": "Not found", "content": "No access to other database."},
+        ).status_code
+        == 404
+    )
 
 
 def test_register_login_me_and_logout():

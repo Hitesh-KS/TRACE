@@ -139,6 +139,28 @@ class DownloadAudit(Base):
     status: Mapped[str] = mapped_column(String(20), nullable=False)
 
 
+class ForensicNote(Base):
+    __tablename__ = "forensic_notes"
+    __table_args__ = (
+        Index("ix_forensic_notes_evidence_created_at", "evidence_id", "created_at"),
+        Index("ix_forensic_notes_case_created_at", "case_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    evidence_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("evidence.id", ondelete="RESTRICT"), nullable=False
+    )
+    case_id: Mapped[str] = mapped_column(
+        String(200), ForeignKey("cases.case_id", ondelete="RESTRICT"), nullable=False
+    )
+    analyst_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
 class EvidenceLedger(Base):
     __tablename__ = "evidence_ledger"
     __table_args__ = (

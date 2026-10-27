@@ -78,6 +78,12 @@ existing evidence remains migratable without inventing historical ownership.
 New uploads record the authenticated submitting user; legacy rows remain
 unattributed until they are reviewed and provisioned separately.
 
+Migration `0005_forensic_notes` adds append-only analyst findings. Analysts
+with explicit membership in an evidence case can create, list, and retrieve
+notes through `/api/v1/evidence/{evidence_id}/notes`; the API derives the
+case and author from the authorized evidence and authenticated session. Notes
+do not modify evidence hashes or append custody-ledger events.
+
 The local stack uses MinIO with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The MinIO console is at `http://localhost:9001`.
 
 ## Backend endpoint authorization
