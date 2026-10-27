@@ -199,12 +199,12 @@ The QR code should contain a non-secret report/evidence verification reference, 
 
 ## 10. Deployment options
 
-| Concern | MinIO | AWS S3 |
-|---|---|---|
-| Best fit | Local development, private infrastructure, or disconnected deployments | Managed cloud and elastic enterprise deployments |
-| Main advantages | Data sovereignty and deployment flexibility | Managed durability, scaling, and native Object Lock integration |
-| Operational considerations | The operator owns availability, upgrades, replication, monitoring, and key management | Requires connectivity, cloud-account controls, cost management, and region/data-residency review |
-| Recommendation | Use for development and approved on-premises/air-gapped deployments | Use for cloud production where policy and jurisdiction permit |
+| Concern | RustFS (local development) | MinIO (private deployment) | AWS S3 |
+|---|---|---|---|
+| Best fit | Local development and S3 API integration tests | Private infrastructure or disconnected deployments | Managed cloud and elastic enterprise deployments |
+| Main advantages | S3-compatible API and Object Lock support for local testing | Data sovereignty and deployment flexibility | Managed durability, scaling, and native Object Lock integration |
+| Operational considerations | The single-drive Compose setup is not production-grade durability or a security boundary | The operator owns availability, upgrades, replication, monitoring, and key management | Requires connectivity, cloud-account controls, cost management, and region/data-residency review |
+| Recommendation | Use only for local development; validate behavior against the actual production provider | Use for approved on-premises/air-gapped deployments | Use for cloud production where policy and jurisdiction permit |
 
 Keep the storage interface provider-neutral, but validate Object Lock semantics, retention configuration, version handling, and encryption behavior against each target provider before migration.
 
