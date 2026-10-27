@@ -60,3 +60,11 @@ class ObjectStorage:
         except BotoCoreError as exc:
             raise StorageUnavailable("Object read failed") from exc
         return response["Body"]
+
+    def delete(self, *, key: str, version_id: str) -> None:
+        try:
+            self.client.delete_object(
+                Bucket=self.bucket, Key=key, VersionId=version_id
+            )
+        except BotoCoreError as exc:
+            raise StorageUnavailable("Object deletion failed") from exc

@@ -161,6 +161,28 @@ class ForensicNote(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
+class CaseReport(Base):
+    __tablename__ = "case_reports"
+    __table_args__ = (
+        Index("ix_case_reports_case_created_at", "case_id", "created_at"),
+        UniqueConstraint("object_key", name="uq_case_reports_object_key"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    case_id: Mapped[str] = mapped_column(
+        String(200), ForeignKey("cases.case_id", ondelete="RESTRICT"), nullable=False
+    )
+    title: Mapped[str] = mapped_column(String(255), nullable=False)
+    creator_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    object_key: Mapped[str] = mapped_column(Text, nullable=False)
+    object_version_id: Mapped[str] = mapped_column(Text, nullable=False)
+    byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
+
+
 class EvidenceLedger(Base):
     __tablename__ = "evidence_ledger"
     __table_args__ = (
