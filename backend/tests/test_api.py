@@ -337,6 +337,45 @@ def test_report_access_requires_analyst_or_auditor_case_membership():
     )
 
 
+def test_judge_can_generate_permitted_report_types_only():
+    client, storage = make_client(actor_role="JUDGE")
+    evidence_bytes = b"judicial review evidence"
+    evidence_version = str(uuid.uuid4())
+    storage.objects[("evidence/judge/original", evidence_version)] = evidence_bytes
+    with client.app.state.session_factory() as session:
+        session.add(
+            Evidence(
+                id=uuid.uuid4(),
+                uploader_id=uuid.UUID("00000000-0000-4000-8000-000000000002"),
+                case_id="case-1",
+                file_name="review.bin",
+                content_type="application/octet-stream",
+                file_sha256=hashlib.sha256(evidence_bytes).hexdigest(),
+                object_key="evidence/judge/original",
+                object_version_id=evidence_version,
+                status="READY",
+                byte_size=len(evidence_bytes),
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
+
+    headers = {"Authorization": "Bearer " + "test-token-" + ("x" * 32)}
+    response = client.post(
+        "/api/v1/cases/case-1/reports",
+        headers=headers,
+        json={"title": "Judicial review", "report_type": "JUDICIAL_REVIEW"},
+    )
+    assert response.status_code == 201
+    assert response.json()["report_type"] == "JUDICIAL_REVIEW"
+    denied = client.post(
+        "/api/v1/cases/case-1/reports",
+        headers=headers,
+        json={"title": "Unsupported", "report_type": "FORENSIC_EXAMINATION"},
+    )
+    assert denied.status_code == 403
+
+
 def test_report_generation_fails_without_evidence_object():
     client, _ = make_client(actor_role="ANALYST")
     with client.app.state.session_factory() as session:
