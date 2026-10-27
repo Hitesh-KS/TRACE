@@ -43,6 +43,9 @@ class User(Base):
     case_memberships: Mapped[list["CaseMembership"]] = relationship(
         back_populates="user", cascade="all, delete-orphan"
     )
+    uploaded_evidence: Mapped[list["Evidence"]] = relationship(
+        back_populates="uploader"
+    )
 
 
 class AuthSession(Base):
@@ -93,8 +96,12 @@ class CaseMembership(Base):
 
 class Evidence(Base):
     __tablename__ = "evidence"
+    __table_args__ = (Index("ix_evidence_uploader_id", "uploader_id"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    uploader_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT")
+    )
     case_id: Mapped[str] = mapped_column(
         String(200),
         ForeignKey("cases.case_id", ondelete="RESTRICT"),
@@ -110,6 +117,7 @@ class Evidence(Base):
     byte_size: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     case: Mapped[Case] = relationship(back_populates="evidence")
+    uploader: Mapped[User | None] = relationship(back_populates="uploaded_evidence")
 
 
 class DownloadAudit(Base):

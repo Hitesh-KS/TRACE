@@ -565,6 +565,7 @@ def create_app(
 
         evidence = Evidence(
             id=evidence_id,
+            uploader_id=user.id,
             case_id=case_id,
             file_name=file.filename or "evidence",
             content_type=file.content_type or "application/octet-stream",

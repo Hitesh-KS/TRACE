@@ -119,6 +119,11 @@ def test_upload_and_verify_stored_evidence():
 
     assert response.status_code == 201
     evidence_id = response.json()["evidence_id"]
+    with client.app.state.session_factory() as session:
+        evidence = session.get(Evidence, uuid.UUID(evidence_id))
+        assert evidence.uploader_id == uuid.UUID(
+            "00000000-0000-4000-8000-000000000002"
+        )
     verification = client.get(
         f"/api/v1/evidence/{evidence_id}/verify",
         headers={"Authorization": "Bearer test-token-" + ("x" * 32)},
