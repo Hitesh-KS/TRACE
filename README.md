@@ -73,6 +73,11 @@ identifiers so the new foreign key can be established, but it does not create
 user memberships. Review the schema before stamping; do not stamp an
 incompatible or incomplete database.
 
+Migration `0004_evidence_uploader` adds a nullable uploader foreign key so
+existing evidence remains migratable without inventing historical ownership.
+New uploads record the authenticated submitting user; legacy rows remain
+unattributed until they are reviewed and provisioned separately.
+
 The local stack uses MinIO with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The MinIO console is at `http://localhost:9001`.
 
 ## Backend endpoint authorization
