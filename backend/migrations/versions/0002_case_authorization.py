@@ -77,9 +77,19 @@ def upgrade() -> None:
             ["case_id", "user_id"],
         )
     elif not _has_foreign_key("case_memberships", "case_id", "cases"):
-        with op.batch_alter_table("case_memberships", recreate="always") as batch:
-            batch.create_foreign_key(
+        if op.get_bind().dialect.name == "sqlite":
+            with op.batch_alter_table("case_memberships", recreate="always") as batch:
+                batch.create_foreign_key(
+                    "fk_case_memberships_case_id_cases",
+                    "cases",
+                    ["case_id"],
+                    ["case_id"],
+                    ondelete="CASCADE",
+                )
+        else:
+            op.create_foreign_key(
                 "fk_case_memberships_case_id_cases",
+                "case_memberships",
                 "cases",
                 ["case_id"],
                 ["case_id"],
@@ -87,9 +97,19 @@ def upgrade() -> None:
             )
 
     if not _has_foreign_key("evidence", "case_id", "cases"):
-        with op.batch_alter_table("evidence", recreate="always") as batch:
-            batch.create_foreign_key(
+        if op.get_bind().dialect.name == "sqlite":
+            with op.batch_alter_table("evidence", recreate="always") as batch:
+                batch.create_foreign_key(
+                    "fk_evidence_case_id_cases",
+                    "cases",
+                    ["case_id"],
+                    ["case_id"],
+                    ondelete="RESTRICT",
+                )
+        else:
+            op.create_foreign_key(
                 "fk_evidence_case_id_cases",
+                "evidence",
                 "cases",
                 ["case_id"],
                 ["case_id"],
