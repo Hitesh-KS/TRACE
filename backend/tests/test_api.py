@@ -2,6 +2,7 @@ import hashlib
 import io
 import uuid
 from dataclasses import replace
+from datetime import datetime, timezone
 
 from fastapi.testclient import TestClient
 from sqlalchemy import create_engine
@@ -10,7 +11,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
 from app.main import create_app
-from app.models import Base
+from app.models import Base, CaseMembership, User
 
 
 class MemoryStorage:
@@ -42,6 +43,25 @@ def make_client():
     )
     storage = MemoryStorage()
     app = create_app(settings, storage=storage, session_factory=sessions, create_schema=False)
+    with sessions() as session:
+        session.add(
+            User(
+                id=uuid.UUID(settings.actor_id),
+                email="configured-actor@local",
+                password_hash="not-used",
+                role="INVESTIGATOR",
+                is_active=True,
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.add(
+            CaseMembership(
+                user_id=uuid.UUID(settings.actor_id),
+                case_id="case-1",
+                created_at=datetime.now(timezone.utc),
+            )
+        )
+        session.commit()
     return TestClient(app), storage
 
 
@@ -132,3 +152,57 @@ def test_auth_rejects_duplicate_registration_and_bad_password():
         "/api/v1/auth/login",
         json={"email": body["email"], "password": "wrong password"},
     ).status_code == 401
+
+
+def test_registered_user_without_case_assignment_cannot_upload():
+    client, _ = make_client()
+    registration = client.post(
+        "/api/v1/auth/register",
+        json={"email": "unassigned@example.test", "password": "correct horse battery"},
+    )
+    assert registration.status_code == 201
+    login = client.post(
+        "/api/v1/auth/login",
+        json={"email": "unassigned@example.test", "password": "correct horse battery"},
+    )
+    token = login.json()["access_token"]
+    response = client.post(
+        "/api/v1/evidence",
+        headers={"Authorization": f"Bearer {token}"},
+        files={"file": ("sample.bin", b"original evidence", "application/octet-stream")},
+        data={
+            "case_id": "case-without-assignment",
+            "client_sha256": hashlib.sha256(b"original evidence").hexdigest(),
+        },
+    )
+    assert response.status_code == 403
+
+
+def test_evidence_uuid_does_not_bypass_case_membership():
+    client, storage = make_client()
+    payload = b"original evidence"
+    digest = hashlib.sha256(payload).hexdigest()
+    response = client.post(
+        "/api/v1/evidence",
+        headers={"Authorization": "Bearer test-token-" + ("x" * 32)},
+        files={"file": ("sample.bin", payload, "application/octet-stream")},
+        data={"case_id": "case-1", "client_sha256": digest},
+    )
+    assert response.status_code == 201
+    evidence_id = response.json()["evidence_id"]
+
+    with client as authenticated_client:
+        registration = authenticated_client.post(
+            "/api/v1/auth/register",
+            json={"email": "other@example.test", "password": "correct horse battery"},
+        )
+        assert registration.status_code == 201
+        token = authenticated_client.post(
+            "/api/v1/auth/login",
+            json={"email": "other@example.test", "password": "correct horse battery"},
+        ).json()["access_token"]
+        verification = authenticated_client.get(
+            f"/api/v1/evidence/{evidence_id}/verify",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    assert verification.status_code == 404
