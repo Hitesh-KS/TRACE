@@ -12,12 +12,22 @@ from sqlalchemy.pool import StaticPool
 
 from app.config import Settings
 from app.main import create_app
-from app.models import AuthSession, Base, Case, CaseMembership, User
+from app.models import (
+    AuthSession,
+    Base,
+    Case,
+    CaseMembership,
+    DownloadAudit,
+    Evidence,
+    User,
+)
+from app.storage import StorageUnavailable
 
 
 class MemoryStorage:
     def __init__(self):
         self.objects = {}
+        self.get_calls = []
 
     def put(self, *, key, body, content_length, content_type):
         version_id = str(uuid.uuid4())
@@ -25,6 +35,9 @@ class MemoryStorage:
         return version_id
 
     def get(self, *, key, version_id):
+        self.get_calls.append((key, version_id))
+        if (key, version_id) not in self.objects:
+            raise StorageUnavailable("missing object version")
         return io.BytesIO(self.objects[(key, version_id)])
 
 
@@ -318,3 +331,107 @@ def test_role_permissions_are_enforced(role, verify_status, upload_status):
         },
     )
     assert upload.status_code == upload_status
+
+
+def test_evidence_listing_and_details_are_case_scoped():
+    client, _ = make_client()
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    payload = b"original evidence"
+    response = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("sample.bin", payload, "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    evidence_id = response.json()["evidence_id"]
+
+    listing = client.get("/api/v1/evidence?limit=1&offset=0", headers=headers)
+    assert listing.status_code == 200
+    assert listing.json()["items"][0]["evidence_id"] == evidence_id
+    details = client.get(f"/api/v1/evidence/{evidence_id}", headers=headers)
+    assert details.status_code == 200
+    assert details.json()["file_sha256"] == hashlib.sha256(payload).hexdigest()
+    assert details.json()["custody_events"][0]["action"] == "INGEST"
+
+
+def test_analyst_downloads_exact_version_and_creates_audit():
+    client, storage = make_client()
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    payload = b"original evidence"
+    response = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("nested/name.bin", payload, "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    evidence_id = response.json()["evidence_id"]
+    with client.app.state.session_factory() as session:
+        user = session.get(User, uuid.UUID("00000000-0000-4000-8000-000000000002"))
+        user.role = "ANALYST"
+        session.commit()
+
+    download = client.get(f"/api/v1/evidence/{evidence_id}/download", headers=headers)
+    assert download.status_code == 200
+    assert download.content == payload
+    assert "attachment" in download.headers["content-disposition"]
+    assert storage.get_calls[0][1] == response.json()["object_version_id"]
+    with client.app.state.session_factory() as session:
+        audit = session.query(DownloadAudit).one()
+        assert audit.status == "INITIATED"
+        assert audit.object_version_id == response.json()["object_version_id"]
+
+
+def test_admin_and_investigator_cannot_download_and_storage_is_not_read():
+    client, storage = make_client()
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    payload = b"original evidence"
+    response = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("sample.bin", payload, "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    evidence_id = response.json()["evidence_id"]
+    denied = client.get(f"/api/v1/evidence/{evidence_id}/download", headers=headers)
+    assert denied.status_code == 403
+    assert storage.get_calls == []
+    with client.app.state.session_factory() as session:
+        assert session.query(DownloadAudit).count() == 0
+
+
+def test_missing_object_version_fails_without_download_audit():
+    client, storage = make_client()
+    headers = {"Authorization": "Bearer test-token-" + ("x" * 32)}
+    payload = b"original evidence"
+    response = client.post(
+        "/api/v1/evidence",
+        headers=headers,
+        files={"file": ("sample.bin", payload, "application/octet-stream")},
+        data={
+            "case_id": "case-1",
+            "client_sha256": hashlib.sha256(payload).hexdigest(),
+        },
+    )
+    evidence_id = response.json()["evidence_id"]
+    with client.app.state.session_factory() as session:
+        user = session.get(User, uuid.UUID("00000000-0000-4000-8000-000000000002"))
+        user.role = "ANALYST"
+        evidence = session.get(Evidence, uuid.UUID(evidence_id))
+        object_key = evidence.object_key
+        object_version_id = evidence.object_version_id
+        session.commit()
+    storage.objects.pop((object_key, object_version_id))
+
+    download = client.get(f"/api/v1/evidence/{evidence_id}/download", headers=headers)
+    assert download.status_code == 503
+    with client.app.state.session_factory() as session:
+        assert session.query(DownloadAudit).count() == 0

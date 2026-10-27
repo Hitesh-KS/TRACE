@@ -112,6 +112,25 @@ class Evidence(Base):
     case: Mapped[Case] = relationship(back_populates="evidence")
 
 
+class DownloadAudit(Base):
+    __tablename__ = "download_audits"
+    __table_args__ = (
+        Index("ix_download_audits_evidence_timestamp", "evidence_id", "timestamp"),
+        Index("ix_download_audits_user_timestamp", "user_id", "timestamp"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    evidence_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("evidence.id", ondelete="RESTRICT"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    object_version_id: Mapped[str] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String(20), nullable=False)
+
+
 class EvidenceLedger(Base):
     __tablename__ = "evidence_ledger"
     __table_args__ = (

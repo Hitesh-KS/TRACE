@@ -73,7 +73,7 @@ identifiers so the new foreign key can be established, but it does not create
 user memberships. Review the schema before stamping; do not stamp an
 incompatible or incomplete database.
 
-The local stack uses RustFS with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance with disk checks bypassed; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The RustFS console is at `http://localhost:9001`.
+The local stack uses MinIO with Object Lock enabled to exercise the S3 API. It runs as a single-drive local development instance; it is not a production storage topology or substitute for testing the selected production provider and retention policy. The MinIO console is at `http://localhost:9001`.
 
 ## Backend endpoint authorization
 
@@ -87,6 +87,9 @@ The local stack uses RustFS with Object Lock enabled to exercise the S3 API. It 
 | `POST /api/v1/admin/cases` | Authenticated `ADMIN` | Creates case metadata only |
 | `POST /api/v1/admin/case-memberships` | Authenticated `ADMIN`; target user and case must exist | Creates membership only |
 | `POST /api/v1/evidence` | Authenticated `INVESTIGATOR` with membership in the submitted case | Stores the object, then appends `INGEST` |
+| `GET /api/v1/evidence` | Authenticated `INVESTIGATOR`, `ANALYST`, or `AUDITOR` with case membership | Returns authorized metadata only |
+| `GET /api/v1/evidence/{evidence_id}` | Authenticated `INVESTIGATOR`, `ANALYST`, or `AUDITOR` with case membership | Returns authorized metadata and custody summaries |
+| `GET /api/v1/evidence/{evidence_id}/download` | Authenticated `ANALYST` with case membership; `ADMIN` is denied | Reads the exact object version and records `INITIATED` download audit |
 | `GET /api/v1/evidence/{evidence_id}/verify` | Authenticated `INVESTIGATOR`, `ANALYST`, or `AUDITOR` with membership; `ADMIN` is denied | Reads the exact object version, validates the chain, then appends `VERIFY` |
 
 Evidence lookups join against `case_memberships` before object storage reads.
@@ -107,7 +110,7 @@ curl -X POST http://localhost:8000/api/v1/evidence \
   -F "client_sha256=<64-character-sha256>"
 ```
 
-The API streams the file to a bounded temporary spool, independently checks the digest, and writes the original bytes to a versioned Object-Locked RustFS bucket with configured retention. An `INGEST` event is committed with the evidence record.
+The API streams the file to a bounded temporary spool, independently checks the digest, and writes the original bytes to a versioned Object-Locked MinIO bucket with configured retention. An `INGEST` event is committed with the evidence record.
 
 ## Verify evidence
 
@@ -129,7 +132,7 @@ PYTHONPATH=. pytest
 ```
 
 Tests use SQLite and an in-memory object store. The local Compose deployment
-uses PostgreSQL and RustFS. Object storage and database writes are not atomic:
+uses PostgreSQL and MinIO. Object storage and database writes are not atomic:
 if the database commit fails after an object upload, the API reports a
 reconciliation-required error and logs the object key/version for an
 operator-managed reconciliation process.
